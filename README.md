@@ -95,10 +95,14 @@ Also derived: `gross_margin`, `margin_pct`, `avg_daily_demand`, `days_of_supply`
 |---|---|---|
 | **Python** | 3.9 – 3.13 (3.11/3.12 recommended) | 3.9 – 3.13 (3.11/3.12 recommended) |
 | **Java (JDK)** | **17+** (Temurin/Zulu) | **17+** (Temurin/Zulu) |
+| Python packages | `pip install -r requirements.txt` | `pip3 install -r requirements.txt` |
 | Git | optional | optional |
 
 > ⚠️ **Java is mandatory** — PySpark runs on the JVM. `java -version` must work
 > before you install anything. PySpark 4.x needs **Java 17+**.
+>
+> Note: Streamlit **1.49+** is required (it replaced the `use_container_width`
+> argument with `width="stretch"`); `pip install -r requirements.txt` handles it.
 
 ### Check Java
 
@@ -182,6 +186,7 @@ the architecture, run under Rosetta or reinstall with
 
 ```bash
 # Run the full pipeline in the terminal and print the KPI summary
+# (bootstraps the simulated HDFS layer automatically if it is missing)
 python pyspark_analytics_engine.py
 
 # Print the optimised physical plan / lineage graph
@@ -189,6 +194,9 @@ python pyspark_analytics_engine.py --explain-plan
 
 # Export the unified 60-row frame to CSV
 python pyspark_analytics_engine.py --export inventory_analytics.csv
+
+# Fail instead of generating the dataset (useful in CI)
+python pyspark_analytics_engine.py --no-bootstrap
 ```
 
 ### 🧹 Reset / regenerate the data
