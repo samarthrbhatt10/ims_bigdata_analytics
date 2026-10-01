@@ -1,0 +1,30 @@
+# =============================================================================
+# SmartStock :: HDFS & PySpark Inventory Analytics Suite
+# Python dependencies
+# =============================================================================
+# Quick install (Windows):  pip install -r requirements.txt
+# Quick install (macOS)  :  python3 -m pip install -r requirements.txt
+#
+# IMPORTANT VERSIONS
+#   * PySpark 4.x  -> requires Java 17+ AND Python 3.9 - 3.13
+#   * PySpark 3.5.x-> requires Java 8/11/17 AND Python <= 3.11
+#   * If you are on Python 3.12+ you MUST use PySpark 4.x, otherwise the
+#     Py4J bridge fails to start.
+# =============================================================================
+
+# --- Big Data processing engine -------------------------------------------
+# PySpark bundles Apache Spark + the Hadoop client libraries.
+pyspark>=3.5.0            # 4.x recommended (works on Python 3.13, needs Java 17)
+
+# --- Data handling ---------------------------------------------------------
+pandas>=2.0.0
+numpy>=1.24.0
+# PyArrow enables the fast columnar Spark <-> Pandas transfer (10-100x faster
+# than the default pickle path). Optional, but the engine auto-detects it.
+pyarrow>=12.0.0
+
+# --- Dashboard -------------------------------------------------------------
+# 1.49+ is required for `width="stretch"` (the replacement for the removed
+# `use_container_width` argument on st.dataframe / st.plotly_chart / buttons).
+streamlit>=1.49.0
+plotly>=5.18.0
