@@ -1,0 +1,39 @@
+# =============================================================================
+# SmartStock theme configuration
+# =============================================================================
+# This file PINS the visual theme so the dashboard always renders the same way
+# for everyone - your examiner, your teammate, on a projector in a dark room.
+#
+# Why it exists: Streamlit otherwise follows the operating system's dark-mode
+# setting. In dark mode it renders body text as #fafafa (near-white), which on
+# our light page background made most of the dashboard unreadable. The values
+# below are the accessible palette; every text/background pair meets the
+# WCAG AA contrast ratio of 4.5:1 (most are AAA at 7:1+).
+#
+# Run with:  streamlit run main_app.py
+# To change the colours, edit [theme] below and restart.
+# =============================================================================
+
+[theme]
+# "light" is deliberate. The whole palette (KPI cards, Plotly charts, the
+# severity colours) is designed for a light surface.
+base = "light"
+
+# Teal - Streamlit's accent: active tab, links, focus rings, primary buttons.
+primaryColor = "#1d7874"
+
+# Page canvas: matches the CSS gradient in main_app.py.
+backgroundColor = "#f7f9fc"
+
+# Sidebar: deep navy. Streamlit pairs this with white text automatically
+# (contrast 10.3:1 = AAA).
+secondaryBackgroundColor = "#0b3c5d"
+
+# Default body text - near-black, 13.8:1 on the page background.
+textColor = "#1c2b36"
+
+font = "sans serif"
+
+[browser]
+# No analytics beacon in a submitted project.
+gatherUsageStats = false

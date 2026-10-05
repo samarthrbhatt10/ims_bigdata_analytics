@@ -31,6 +31,7 @@ ims_bigdata_analytics/
 ├── pyspark_analytics_engine.py   # File 2 · PySpark analytics engine
 ├── main_app.py                   # File 3 · Streamlit dashboard
 ├── requirements.txt
+├── .streamlit/config.toml        # pins the light theme (see Accessibility)
 └── hdfs/                         # AUTO-GENERATED (git-ignored)
     └── user/hadoop/inventory/raw/
         ├── _manifest.json        # row counts, edge cases, seed
@@ -139,6 +140,32 @@ python hdfs_storage_mock.py --transactions 2500000      # 2.5M rows, same code
 
 ---
 
+## Accessibility & colours
+
+The dashboard is designed for a **light** surface and every text/background pair
+clears **WCAG AA (4.5:1)**, most at AAA (7:1+).
+
+| Element | Ratio |
+|---|---|
+| KPI value / section heading | 11.6:1 (AAA) |
+| KPI label / delta | 7.7:1 (AAA) |
+| KPI hint, hero subtitle | 6.4–6.8:1 (AA) |
+| Tab panel body text | 13.8:1 (AAA) |
+| Sidebar text & buttons | 8.6–10.3:1 (AAA) |
+| Footer, section subtitles | 7.3:1 (AAA) |
+
+**Why `.streamlit/config.toml` exists.** Streamlit follows your operating
+system's dark-mode setting. In dark mode it renders body text near-white
+(`#fafafa`), which on a light page is unreadable — that is exactly what
+happened before the theme was pinned. The config file sets `base = "light"` and
+brands the primary/background/text colours, and `main_app.py` additionally forces
+the surface and text colour in CSS so the page stays readable even if someone
+toggles the theme from the Streamlit menu.
+
+To restyle the project, edit `[theme]` in `.streamlit/config.toml` and restart.
+
+---
+
 ## Troubleshooting
 
 | Symptom | Cause | Fix |
@@ -150,6 +177,7 @@ python hdfs_storage_mock.py --transactions 2500000      # 2.5M rows, same code
 | `Did not find winutils.exe` | Hadoop utilities missing | **Harmless** warning in local mode — ignore |
 | Empty KPIs | Filters exclude everything | **Reset all filters** in the sidebar |
 | Port 8501 busy | Another instance | `streamlit run main_app.py --server.port 8502` |
+| Text looks faint / wrong colours | A dark OS theme is overriding Streamlit | Confirm `.streamlit/config.toml` exists and restart the app |
 
 **Set `JAVA_HOME` if needed**
 

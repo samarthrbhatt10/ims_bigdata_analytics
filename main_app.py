@@ -63,12 +63,20 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-#: Enterprise colour palette. Class A = healthy gold, class C = the problem.
+#: Chart fills (donut slices, bars) -- chosen to be distinguishable and
+#: attractive. Every piece of chart TEXT uses CHART_TEXT below, because these
+#: bright colours only fail contrast as foreground, not as a large fill.
 ABC_COLORS = {"A": "#00b894", "B": "#fdcb6e", "C": "#e17055"}
 SEVERITY_COLORS = {
     "CRITICAL": "#d63031", "HIGH": "#e17055",
     "MEDIUM": "#fdcb6e", "OK": "#00b894",
 }
+#: Explicit text colour for every axis label, tick and legend entry (13.8:1 on
+#: white). Plotly otherwise inherits Streamlit's theme colour, which is
+#: near-white in dark mode and made the axis labels disappear entirely.
+CHART_TEXT = "#1c2b36"
+#: Gridlines: visible enough to guide the eye, faint enough not to compete.
+CHART_GRID = "#e3e9f0"
 ACCENT = "#1d7874"       # teal - KPI card accent bar
 
 #: Default (i.e. "no filter") value of every sidebar widget. Kept in one place
@@ -90,23 +98,77 @@ def _reset_filters() -> None:
 CSS = """
 <style>
 /* ---------- Global polish ---------- */
-.stApp { background: linear-gradient(180deg, #f7f9fc 0%, #eef2f7 100%); }
 .block-container { padding-top: 2.1rem; padding-bottom: 3rem; max-width: 1500px; }
+
+/* =============================================================================
+   0. THEME OVERRIDE  --  the most important block in this file.
+
+   Streamlit follows the OS dark-mode setting by default. In dark mode it
+   renders body text as #fafafa (near-white). Our page background is LIGHT, so
+   dark mode produced near-white text on a near-white page: the dashboard became
+   unreadable. `.streamlit/config.toml` also pins base="light", but a user can
+   still flip the theme from the Streamlit menu, so we do not rely on that
+   alone -- we force the surface and the text colour here.
+   ============================================================================= */
+.stApp, [data-testid="stAppViewContainer"] > .main,
+[data-testid="stMain"], [data-testid="stMain"] > div {
+    background: linear-gradient(180deg, #f7f9fc 0%, #eef2f7 100%) !important;
+    color: #1c2b36 !important;
+}
+/* Every text node in the main area, including markdown inside tabs and
+   expanders -- which is exactly where the invisible text lived. */
+[data-testid="stMain"] p, [data-testid="stMain"] li,
+[data-testid="stMain"] td, [data-testid="stMain"] th,
+[data-testid="stMain"] span, [data-testid="stMain"] label,
+[data-testid="stMain"] h1, [data-testid="stMain"] h2, [data-testid="stMain"] h3,
+[data-testid="stMain"] h4, [data-testid="stMain"] summary {
+    color: #1c2b36;
+}
+/* Tab labels: the INACTIVE ones were light grey on white and vanished. */
+[data-testid="stTabs"] [role="tab"] { color: #33475a; font-weight: 600; }
+[data-testid="stTabs"] [aria-selected="true"] { color: #0b3c5d; }
+[data-testid="stTabs"] [data-baseweb="tab-highlight"],
+[data-testid="stTabs"] [data-baseweb="tab-border"] { background-color: #1d7874; }
+/* Inline code chips: dark-on-pale so they read in either theme. */
+[data-testid="stMain"] code {
+    background: #e8eef4 !important; color: #0b3c5d !important;
+    border: 1px solid #d3dee8; border-radius: 5px; padding: 0.05em 0.32em;
+}
+/* Markdown tables + rules + captions. */
+[data-testid="stMain"] table { border-color: #dbe4ec; }
+[data-testid="stMain"] table th { color: #0b3c5d; background: #eef3f8; }
+[data-testid="stMain"] table td { color: #1c2b36; border-color: #e3e9f0; }
+[data-testid="stMain"] hr { border-color: #dbe4ec; }
+[data-testid="stCaptionContainer"] { color: #445565; }
+[data-testid="stAlert"] { color: #1c2b36; }
+/* Expander header + the JSON viewer. */
+div[data-testid="stExpander"] details {
+    border: 1px solid #e3e9f0; border-radius: 12px; background: #ffffff; }
+div[data-testid="stExpander"] summary { color: #0b3c5d !important; }
+div[data-testid="stExpander"] summary p { color: #0b3c5d !important; }
 
 /* ---------- Hero header ---------- */
 .smartstock-hero {
-    background: linear-gradient(115deg, #0b3c5d 0%, #1d7874 55%, #14b8a6 100%);
+    /* The gradient deliberately stays in the DARK teal range. Its previous
+       light end (#14b8a6) put the body paragraph at only 2.3:1 against the
+       pale mint text; #145f5c lifts the worst-case stop to 6.75:1 (AAA)
+       while still reading as a navy-to-teal sweep. */
+    background: linear-gradient(115deg, #0b3c5d 0%, #145f5c 100%);
     padding: 1.5rem 1.9rem; border-radius: 16px; margin-bottom: 1.1rem;
     box-shadow: 0 10px 28px rgba(11, 60, 93, 0.28);
 }
 .smartstock-hero h1 { color: #ffffff; font-size: 2.05rem; margin: 0;
                       font-weight: 800; letter-spacing: -0.4px; }
-.smartstock-hero p  { color: #d8f3ef; font-size: 0.95rem; margin: 0.45rem 0 0;
+/* #e8f7f4 measures 6.75:1 against the darkest gradient stop and 5.5:1 against
+   the lightest, so the paragraph is readable across its whole width. */
+.smartstock-hero p  { color: #e8f7f4; font-size: 0.95rem; margin: 0.45rem 0 0;
                       line-height: 1.5; }
 .hero-pills { margin-top: 0.85rem; }
+/* Pills can sit on the LIGHT end of the gradient, so they carry their own
+   pale background and dark text (11.1:1) rather than white-on-teal. */
 .hero-pill {
-    display: inline-block; background: rgba(255,255,255,0.16);
-    color: #ffffff; border: 1px solid rgba(255,255,255,0.32);
+    display: inline-block; background: #cdeee9; color: #06323f;
+    border: 1px solid #a8ddd5;
     border-radius: 999px; padding: 0.2rem 0.75rem;
     font-size: 0.76rem; margin-right: 0.4rem; font-weight: 600;
 }
@@ -124,7 +186,9 @@ CSS = """
 }
 .kpi-card:hover { transform: translateY(-3px);
                   box-shadow: 0 8px 20px rgba(16,42,67,0.13); }
-.kpi-label { color: #5c7081; font-size: 0.63rem; font-weight: 700;
+/* All the greys below were re-picked to clear WCAG AA (4.5:1) on white. The
+   previous values measured 2.9:1 and were effectively invisible. */
+.kpi-label { color: #445565; font-size: 0.63rem; font-weight: 700;
              text-transform: uppercase; letter-spacing: 0.35px;
              line-height: 1.35; word-break: keep-all; hyphens: none;
              /* Reserve 4 lines so the KPI VALUES line up across the row,
@@ -134,11 +198,11 @@ CSS = """
              margin: 0.28rem 0 0.15rem 0; line-height: 1.1;
              letter-spacing: -0.5px; white-space: nowrap; }
 .kpi-delta { font-size: 0.7rem; font-weight: 600; line-height: 1.4; }
-.kpi-delta.up   { color: #00a884; }
-.kpi-delta.warn { color: #d35400; }
-.kpi-delta.bad  { color: #d63031; }
-.kpi-delta.ok   { color: #5c7081; }
-.kpi-hint { color: #8898a6; font-size: 0.63rem; line-height: 1.45;
+.kpi-delta.up   { color: #00694f; }
+.kpi-delta.warn { color: #9a4a00; }
+.kpi-delta.bad  { color: #b3261e; }
+.kpi-delta.ok   { color: #445565; }
+.kpi-hint { color: #4f6170; font-size: 0.63rem; line-height: 1.45;
             margin-top: 0.4rem; border-top: 1px dashed #e3e9f0;
             padding-top: 0.4rem; }
 
@@ -149,22 +213,42 @@ CSS = """
                    font-weight: 750; }
 .section-head .dot { width: 9px; height: 22px; border-radius: 5px;
                      background: linear-gradient(180deg,#0b3c5d,#1d7874); }
-.section-sub { color: #6b7c8c; font-size: 0.83rem; margin: 0.1rem 0 0.85rem 0; }
+.section-sub { color: #445565; font-size: 0.83rem; margin: 0.1rem 0 0.85rem 0; }
 
-/* ---------- Sidebar ---------- */
+/* ---------- Sidebar (navy, 10.3:1 = AAA) ---------- */
 [data-testid="stSidebar"] { background: linear-gradient(180deg,#0b3c5d 0%,#10496a 100%); }
 [data-testid="stSidebar"] h1, [data-testid="stSidebar"] h2,
 [data-testid="stSidebar"] h3, [data-testid="stSidebar"] label,
 [data-testid="stSidebar"] p, [data-testid="stSidebar"] li { color: #e8f4f6 !important; }
 [data-testid="stSidebar"] .stMarkdown a { color: #7fe3d8 !important; }
-[data-testid="stSidebar"] hr { border-color: rgba(255,255,255,0.18); }
+[data-testid="stSidebar"] hr { border-color: rgba(255,255,255,0.28); }
+/* Sidebar buttons: Streamlit paints them with the LIGHT theme's dark label
+   colour, which left the labels invisible on the navy panel (1.45:1). */
+[data-testid="stSidebar"] button {
+    color: #e8f4f6 !important;
+    background: rgba(255,255,255,0.10) !important;
+    border: 1px solid rgba(255,255,255,0.34) !important;
+    font-weight: 600;
+}
+[data-testid="stSidebar"] button:hover {
+    background: rgba(255,255,255,0.20) !important;
+    border-color: rgba(255,255,255,0.55) !important;
+}
+/* Same problem on the sidebar multiselects / slider / toggle. */
+[data-testid="stSidebar"] [data-baseweb="select"] > div {
+    background: rgba(255,255,255,0.10) !important;
+    border-color: rgba(255,255,255,0.30) !important;
+}
+[data-testid="stSidebar"] [data-baseweb="tag"] {
+    background: rgba(255,255,255,0.22) !important; color: #ffffff !important; }
+[data-testid="stSidebar"] [data-baseweb="tag"] svg { fill: #ffffff !important; }
+[data-testid="stSidebar"] [data-testid="stToggle"] label p { color: #e8f4f6 !important; }
 
 /* ---------- Misc ---------- */
-div[data-testid="stExpander"] details {
-    border: 1px solid #e3e9f0; border-radius: 12px; background: #ffffff; }
-.small-note { color: #6b7c8c; font-size: 0.78rem; }
-.footer { text-align: center; color: #8898a6; font-size: 0.75rem;
-          margin-top: 2.2rem; border-top: 1px solid #e3e9f0; padding-top: 0.9rem; }
+.small-note { color: #445565; font-size: 0.78rem; }
+.footer { text-align: center; color: #445565; font-size: 0.75rem;
+          margin-top: 2.2rem; border-top: 1px solid #dbe4ec; padding-top: 0.9rem; }
+.footer code { background: #e8eef4 !important; color: #0b3c5d !important; }
 </style>
 """
 st.markdown(CSS, unsafe_allow_html=True)
@@ -533,6 +617,7 @@ def chart_revenue_by_category(categories: pd.DataFrame) -> None:
     )
     figure.update_traces(
         textposition="outside", textfont_size=11,
+        textfont_color=CHART_TEXT,          # value labels sit on white
         hovertemplate=(
             "<b>%{y}</b><br>Revenue: $%{x:,.2f}<br>"
             "SKUs: %{customdata[0]}<br>Units sold: %{customdata[1]}<br>"
@@ -543,7 +628,11 @@ def chart_revenue_by_category(categories: pd.DataFrame) -> None:
         height=380, margin=dict(l=10, r=90, t=10, b=10),
         xaxis_title=None, yaxis_title=None, showlegend=False,
         plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
-        font=dict(family="Source Sans Pro, Segoe UI, sans-serif", size=12),
+        font=dict(family="Source Sans Pro, Segoe UI, sans-serif",
+                  size=12, color=CHART_TEXT),
+        xaxis=dict(tickfont=dict(color=CHART_TEXT), showgrid=True,
+                   gridcolor=CHART_GRID, zeroline=False),
+        yaxis=dict(tickfont=dict(color=CHART_TEXT), showgrid=False),
     )
     st.plotly_chart(figure, width="stretch",
                     config={"displayModeBar": False})
@@ -557,7 +646,8 @@ def chart_abc_distribution(abc: pd.DataFrame) -> None:
         marker=dict(colors=[ABC_COLORS.get(c, "#8395a7") for c in abc["abc_class"]],
                     line=dict(color="#ffffff", width=2)),
         textinfo="label+percent",
-        textfont=dict(size=12),
+        # Slice labels sit on the white page, not on the coloured slice.
+        textfont=dict(size=12, color=CHART_TEXT),
         hovertemplate="<b>%{label}</b><br>SKUs: %{value}<br>"
                       "Share: %{percent}<extra></extra>",
     ))
@@ -568,8 +658,9 @@ def chart_abc_distribution(abc: pd.DataFrame) -> None:
     )
     figure.update_layout(
         height=380, margin=dict(t=10, b=10, l=10, r=10), showlegend=True,
+        font=dict(color=CHART_TEXT),
         legend=dict(orientation="h", yanchor="bottom", y=-0.12, x=0.5,
-                    xanchor="center", font=dict(size=11)),
+                    xanchor="center", font=dict(size=11, color=CHART_TEXT)),
         paper_bgcolor="rgba(0,0,0,0)",
     )
     st.plotly_chart(figure, width="stretch",
@@ -601,19 +692,27 @@ def chart_pareto_curve(products: pd.DataFrame) -> None:
         yaxis="y2",
         hovertemplate="Cumulative: %{y:.1f}%<extra></extra>",
     )
-    for threshold, colour in ((80, "#00b894"), (95, "#fdcb6e")):
+    # Threshold lines use the DARK variants of the ABC colours, not the bright
+    # fills: as annotation TEXT the bright amber measured only 1.5:1 on white.
+    # The bars keep the bright palette, because a large filled area is not a
+    # contrast failure.
+    for threshold, colour in ((80, "#007a5c"), (95, "#8a5a00")):
         figure.add_hline(y=threshold, line_dash="dash", line_color=colour,
                          annotation_text="{}%".format(threshold),
                          annotation_position="top left",
                          annotation_font=dict(size=10, color=colour))
     figure.update_layout(
         height=400, barmode="overlay", margin=dict(t=15, b=10, l=10, r=10),
+        font=dict(color=CHART_TEXT),
         xaxis=dict(title="SKU (top 25 by revenue)", tickangle=-60,
-                   tickfont=dict(size=9)),
-        yaxis=dict(title="Revenue ($)"),
+                   tickfont=dict(size=9, color=CHART_TEXT), showgrid=False),
+        yaxis=dict(title="Revenue ($)", tickfont=dict(color=CHART_TEXT),
+                   gridcolor=CHART_GRID),
         yaxis2=dict(title="Cumulative %", overlaying="y", side="right",
-                    range=[0, 105], showgrid=False),
-        legend=dict(orientation="h", y=1.12, x=0, font=dict(size=10)),
+                    range=[0, 105], showgrid=False,
+                    tickfont=dict(color=CHART_TEXT)),
+        legend=dict(orientation="h", y=1.12, x=0,
+                    font=dict(size=10, color=CHART_TEXT)),
         plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
         hovermode="x unified",
     )
@@ -635,11 +734,12 @@ def chart_severity_donut(products: pd.DataFrame) -> None:
         marker=dict(colors=[SEVERITY_COLORS.get(s, "#8395a7")
                             for s in severity["alert_severity"]],
                     line=dict(color="#ffffff", width=2)),
-        textinfo="label+value", textfont=dict(size=11),
+        textinfo="label+value", textfont=dict(size=11, color=CHART_TEXT),
         hovertemplate="<b>%{label}</b><br>SKUs: %{value}<extra></extra>",
     ))
     figure.update_layout(
         height=400, margin=dict(t=10, b=10), showlegend=False,
+        font=dict(color=CHART_TEXT),
         paper_bgcolor="rgba(0,0,0,0)",
     )
     st.plotly_chart(figure, width="stretch",
