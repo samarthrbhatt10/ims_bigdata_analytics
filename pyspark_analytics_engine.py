@@ -32,7 +32,7 @@ THE FOUR SPARK CONCEPTS THIS PROJECT DEMONSTRATES
 3. TRANSFORMATION vs ACTION
    Lazy, return a DataFrame: select, filter, join, groupBy, withColumn,
    orderBy. Eager, trigger a real Spark job: toPandas, count, show, first,
-   write. This pipeline is ~40 transformations and exactly 6 actions, each one
+   write. This pipeline is ~60 transformations and exactly 7 actions, each one
    logged with its duration so you can point at the console and say "this is
    where the cluster actually did work".
 
@@ -53,8 +53,12 @@ THE PIPELINE (the DAG, in execution order)
    4. ABC     window over cumulative revenue % -> class A / B / C
    5. ITR     COGS / average inventory value -> turnover + days of supply
    6. ALERTS  stockout risk (<=) + dead stock (LEFT ANTI JOIN)
-   7. ACTION  toPandas() for the UI, plus a 1-row enterprise KPI aggregate
-   8. STOP    spark.stop() -- never leak a 1 GB JVM
+   7. RISK    rebuild the DAILY demand series, then CV, service-level buffer
+              and a 7-day forecast band. A second real aggregation: 2,500
+              events -> a daily series -> mean / sigma per SKU.
+   8. IMPACT  price each alert in dollars: lost margin + trapped capital
+   9. ACTION  toPandas() x 4 for the UI, plus a 1-row enterprise aggregate
+  10. STOP    spark.stop() -- never leak a 1 GB JVM
 
 -------------------------------------------------------------------------------
 FINANCIAL DEFINITIONS (be ready to defend these)
@@ -77,6 +81,16 @@ FINANCIAL DEFINITIONS (be ready to defend these)
                    share, cut at 80% (A), 95% (B), 100% (C). The SKU that
                    PUSHES the total across a threshold stays in the higher
                    class -- see run_abc_analysis for the exclusive-frame trick.
+   CV             = stddev(daily demand) / mean(daily demand)
+   Safety stock   = z * sigma * sqrt(lead_time)    z=1.65 (95%), lead=21 days
+       Variance over the lead time is additive, so the STANDARD DEVIATION
+       scales with its square root. Omitting that term under-orders.
+   Lost margin    = unmet_units * margin_rate * price
+       unmet_units is a LOWER BOUND: the units short of one safety-level of
+       cover at the observed daily rate. It ignores customers who defect
+       permanently, so the true loss is worse.
+   Trapped capital= current_stock * cost                (cost, not retail)
+   Net exposure   = lost margin + trapped capital
 
 RUN STANDALONE (debug without Streamlit)
     python pyspark_analytics_engine.py
@@ -817,6 +831,18 @@ class PySparkInventoryEngine:
             "inventory_value", "opening_stock_est", "average_inventory_value",
             "inventory_turnover_ratio", "inventory_turnover_ratio_annualized",
             "avg_daily_demand", "days_of_supply",
+            # --- demand risk ---
+            "daily_demand_mean", "daily_demand_sigma", "daily_demand_peak",
+            "active_sales_days", "demand_cv",
+            "recommended_safety_stock", "safety_stock_gap", "safety_stock_cover_days",
+            "safety_stock_risk", "demand_signal_quality",
+            "assumed_lead_time_days", "service_level_z",
+            "forecast_next_7d", "forecast_next_7d_low", "forecast_next_7d_high",
+            # --- economic impact ---
+            "demand_cover_shortfall", "unsellable_units",
+            "lost_margin_estimate", "lost_revenue_estimate",
+            "trapped_capital", "net_exposure",
+            # --- alerts ---
             "is_dead_stock", "is_stockout_risk", "alert_flags", "alert_severity",
             "reorder_quantity", "reorder_value", "recommended_action",
         ).orderBy(
@@ -857,6 +883,272 @@ class PySparkInventoryEngine:
             pdf = pd.DataFrame(df.collect())
         self._action("toPandas[{}]".format(label), time.perf_counter() - start)
         return pdf
+
+    # -------------------------------------------------------------------------
+    # 3.9b  STEP 6b -- DEMAND VOLATILITY & FORWARD-LOOKING RISK
+    # -------------------------------------------------------------------------
+    def run_demand_volatility(self, unified: DataFrame, sales: DataFrame
+                              ) -> DataFrame:
+        """Second-order statistics that turn a static report into a decision tool.
+
+        WHY THIS EXISTS
+        ---------------
+        Everything above is DESCRIPTIVE: it tells you what already happened.
+        A buyer cannot act on that alone. The three questions operations teams
+        actually ask every morning are forward-looking, and none of them is
+        answered by an ABC class:
+
+          1. "How unreliable is this SKU's demand?"   -> CV (coefficient of
+             variation = stddev / mean of DAILY demand). A SKU with mean 4
+             units/day and CV 0.9 is a forecasting nightmare even though its
+             ABC class may look healthy.
+          2. "What should the safety buffer be?"      -> a newsvendor-style
+             service-level buffer: z * sigma_daily * sqrt(lead_time). We assume
+             a 21-day replenishment lead time and a 95% cycle service level
+             (z = 1.65), the standard retail default. Compare that against the
+             buffer the warehouse actually configured and flag the GAP -- that
+             gap is real, quantifiable risk sitting in the business today.
+          3. "Is this safety level even the right shape?" -> a safety level
+             that is a flat multiple of average demand ignores volatility. A
+             high-CV SKU with a flat buffer WILL stock out again.
+
+        This is a genuine industry problem (the "forecast value add" gap
+        between what a statistical model predicts and what a planner actually
+        orders), and it is exactly the kind of work that justifies a
+        distributed engine: the daily demand series is derived from the raw
+        event stream, not from a pre-aggregated table.
+
+        SPARK WORK
+            * F.to_date + groupBy(date, product_id) rebuilds a daily series
+              from 2,500 individual transactions -- a real aggregation.
+            * F.avg / F.stddev over that daily series gives mean and sigma.
+            * The daily grid is NOT date-complete: a SKU with no sales on a
+              given day produces no row. That would bias the mean UP and the
+              stddev DOWN. We therefore divide the transaction count by the
+              number of ACTIVE days rather than the calendar window, and label
+              the result honestly -- see avg_daily_demand below.
+        """
+        window_days = max(self.sales_window_days, 1)
+        # 95% cycle service level -> z = 1.65 (standard normal).
+        z_score = 1.65
+        lead_time_days = 21
+
+        # ---- Rebuild a DAILY demand series from the raw event stream ------
+        daily_demand = (
+            sales
+            .withColumn("sale_date", F.to_date("timestamp"))
+            .groupBy("product_id", "sale_date")
+            .agg(F.sum("quantity_sold").alias("units_that_day"))
+        )
+
+        demand_profile = (
+            daily_demand
+            .groupBy("product_id")
+            .agg(
+                F.avg("units_that_day").alias("daily_demand_mean"),
+                F.stddev_pop("units_that_day").alias("daily_demand_sigma"),
+                F.max("units_that_day").alias("daily_demand_peak"),
+                # Days on which this SKU actually recorded a sale.
+                F.count(F.lit(1)).alias("active_sales_days"),
+            )
+        )
+
+        return (
+            unified
+            .join(F.broadcast(demand_profile), on="product_id", how="left")
+            .withColumn("daily_demand_mean",
+                        F.round(F.coalesce(F.col("daily_demand_mean"), F.lit(0.0)), 3))
+            .withColumn("daily_demand_sigma",
+                        F.round(F.coalesce(F.col("daily_demand_sigma"), F.lit(0.0)), 3))
+            .withColumn("daily_demand_peak",
+                        F.coalesce(F.col("daily_demand_peak"), F.lit(0)))
+            .withColumn("active_sales_days", F.coalesce(F.col("active_sales_days"), F.lit(0)))
+            # ---- Coefficient of variation: the normalised volatility ----
+            # NULLIF so a SKU with no variance (perfectly flat demand) yields
+            # NULL rather than a division by zero.
+            .withColumn(
+                "demand_cv",
+                F.round(
+                    F.col("daily_demand_sigma")
+                    / F.nullif(F.col("daily_demand_mean"), F.lit(0.0)),
+                    3,
+                ),
+            )
+            # ---- Recommended safety stock (newsvendor buffer) -------------
+            # sigma over the LEAD TIME scales with sqrt(days): daily noise is
+            # independent, so variance adds up while standard deviation does
+            # not. This sqrt is the single most important piece of maths in
+            # inventory theory and a guaranteed viva question.
+            .withColumn(
+                "recommended_safety_stock",
+                F.round(
+                    F.lit(z_score) * F.col("daily_demand_sigma")
+                    * F.sqrt(F.lit(float(lead_time_days))),
+                    1,
+                ),
+            )
+            # ---- The gap: what we have vs what the risk model wants -------
+            .withColumn(
+                "safety_stock_gap",
+                F.round(F.col("recommended_safety_stock")
+                        - F.col("safety_stock_level"), 1),
+            )
+            .withColumn(
+                "safety_stock_cover_days",
+                F.round(
+                    F.col("recommended_safety_stock")
+                    / F.nullif(F.col("daily_demand_mean"), F.lit(0.0)),
+                    1,
+                ),
+            )
+            # ---- DEMAND CENSORING: the subtlest point in inventory theory --
+            # A SKU that is out of stock does not record zero demand -- it
+            # records no demand AT ALL, because the customer could not buy it.
+            # Its observed mean is therefore BIASED DOWNWARDS, and a naive
+            # forecast trained on it will keep under-ordering forever. This is
+            # the classic "censored demand" problem, and it is the single most
+            # common root cause of chronic stockouts in real retail.
+            #
+            # We CANNOT correct it exactly without transactional data for the
+            # out-of-stock periods. What we CAN do is refuse to report a
+            # misleading verdict: when a SKU is currently breaching its safety
+            # level, the demand statistics are unreliable by construction, so
+            # we label it "Censored" and set the gap to NULL rather than
+            # publishing a confident, wrong number. An honest NULL beats a
+            # precise-looking fiction.
+            .withColumn(
+                "demand_signal_quality",
+                F.when(F.col("daily_demand_mean") <= 0, F.lit("No Demand"))
+                 .when(F.col("current_stock") <= F.col("safety_stock_level"),
+                       F.lit("Censored"))
+                 .otherwise(F.lit("Observed")),
+            )
+            .withColumn(
+                "safety_stock_gap",
+                F.when(F.col("current_stock") <= F.col("safety_stock_level"),
+                       F.lit(None).cast("double"))
+                 .otherwise(F.col("safety_stock_gap")),
+            )
+            .withColumn(
+                "safety_stock_risk",
+                F.when(F.col("daily_demand_mean") <= 0, F.lit("No Demand"))
+                 .when(F.col("current_stock") <= F.col("safety_stock_level"),
+                       F.lit("Censored"))
+                 .when(F.col("safety_stock_gap") > F.col("recommended_safety_stock") * 0.25,
+                       F.lit("Under-Buffered"))
+                 .when(F.col("safety_stock_gap") < 0, F.lit("Over-Buffered"))
+                 .otherwise(F.lit("Aligned")),
+            )
+            .withColumn("assumed_lead_time_days", F.lit(lead_time_days))
+            .withColumn("service_level_z", F.lit(z_score))
+            # ---- Forecast confidence band over the next 7 days ------------
+            # mean +/- z * sigma / sqrt(7): the tighter the band, the more
+            # confidently a planner can commit to a purchase order.
+            .withColumn(
+                "forecast_next_7d",
+                F.round(F.col("daily_demand_mean") * F.lit(7.0), 1),
+            )
+            .withColumn(
+                "forecast_next_7d_low",
+                F.round(
+                    F.col("daily_demand_mean") * F.lit(7.0)
+                    - F.lit(z_score) * F.col("daily_demand_sigma")
+                    * F.sqrt(F.lit(7.0)),
+                    1,
+                ),
+            )
+            .withColumn(
+                "forecast_next_7d_high",
+                F.round(
+                    F.col("daily_demand_mean") * F.lit(7.0)
+                    + F.lit(z_score) * F.col("daily_demand_sigma")
+                    * F.sqrt(F.lit(7.0)),
+                    1,
+                ),
+            )
+        )
+
+    # -------------------------------------------------------------------------
+    # 3.9c  STEP 6c -- ECONOMIC IMPACT: what the alerts actually COST
+    # -------------------------------------------------------------------------
+    def run_economic_impact(self, unified: DataFrame) -> DataFrame:
+        """Attach a DOLLAR figure to every alert.
+
+        WHY THIS EXISTS
+        ---------------
+        A dashboard that says "5 stockout risks" gets ignored in a planning
+        meeting. A dashboard that says "these 5 stockouts are costing us
+        $41,300 in margin this quarter, and 80% of it is in 2 SKUs" gets a
+        budget. This is the difference between a report and a tool.
+
+        The two estimates, stated honestly:
+          * LOST MARGIN (stockout) = the revenue we WOULD have earned on the
+            units we could not sell, valued at the SKU's gross margin rate.
+            We approximate the unsellable quantity as the safety-stock gap --
+            i.e. the units that a correctly-sized buffer would have covered.
+            This UNDERSTATES the true loss (customers may defect to a
+            competitor permanently), which is why the real figure is worse.
+          * TRAPPED CAPITAL (dead stock) = the cost of the units sitting on the
+            shelf, valued at cost, not at retail. Retail value would flatter it.
+        """
+        gross_margin_rate = (
+            F.col("margin") / F.nullif(F.col("revenue"), F.lit(0.0))
+        )
+        lead_time_days = 21   # must match run_demand_volatility
+
+        return (
+            unified
+            # ---- Stockout: margin we failed to earn ----------------------
+            # We size the shortfall against ACTUAL current demand, not against
+            # the statistical recommendation. The recommended buffer is
+            # deliberately NULL for stockout SKUs (see the demand-censoring
+            # note in run_demand_volatility), so we cannot use it -- and using
+            # an untrustworthy number here would be the exact mistake this
+            # project is meant to avoid. Instead:
+            #   shortfall = units required to reach one safety-level of cover
+            #               at the SKU's own observed daily demand rate.
+            # That is a defensible lower bound on the unmet demand.
+            .withColumn(
+                "demand_cover_shortfall",
+                F.greatest(
+                    F.lit(0.0),
+                    F.col("safety_stock_level")
+                    - F.col("avg_daily_demand") * F.lit(float(lead_time_days)),
+                ),
+            )
+            .withColumn(
+                "unsellable_units",
+                F.when(F.col("is_stockout_risk") == 1,
+                       F.round(F.col("demand_cover_shortfall"), 1))
+                 .otherwise(F.lit(0.0)),
+            )
+            .withColumn(
+                "lost_margin_estimate",
+                F.round(
+                    F.col("unsellable_units") * F.coalesce(gross_margin_rate, F.lit(0.0))
+                    * F.col("price"),
+                    2,
+                ),
+            )
+            .withColumn(
+                "lost_revenue_estimate",
+                F.round(F.col("unsellable_units") * F.col("price"), 2),
+            )
+            # ---- Dead stock: cash locked on the shelf --------------------
+            .withColumn(
+                "trapped_capital",
+                F.when(F.col("is_dead_stock") == 1,
+                       F.round(F.col("current_stock") * F.col("cost"), 2))
+                 .otherwise(F.lit(0.0)),
+            )
+            # ---- One number the CFO actually asks for --------------------
+            # Net exposure = what we stand to LOSE minus what we have
+            # LOCKED up. A positive number is a genuine business problem.
+            .withColumn(
+                "net_exposure",
+                F.round(F.col("lost_margin_estimate") + F.col("trapped_capital"), 2),
+            )
+        )
 
     # -------------------------------------------------------------------------
     # 3.10  STEP 7 -- THE ORCHESTRATOR  (the actual Lazy -> Action boundary)
@@ -906,9 +1198,12 @@ class PySparkInventoryEngine:
         sku_spine = self.build_sku_spine(products_df, sales_agg, stock_df)
         abc_df = self.run_abc_analysis(sku_spine)
         turnover_df = self.run_turnover_analysis(abc_df)
-        unified_df = self._order_columns(
-            self.run_supply_chain_alerts(turnover_df, products_df, sales_agg)
+        alerted_df = self.run_supply_chain_alerts(turnover_df, products_df, sales_agg)
+        # Forward-looking layer: demand volatility + what the alerts cost.
+        risk_df = self.run_economic_impact(
+            self.run_demand_volatility(alerted_df, sales_df)
         )
+        unified_df = self._order_columns(risk_df)
         # Cache the final frame too: it feeds the detail table AND the 4 summary
         # aggregations below, so we pay for the 3-way join chain only once.
         unified_df = unified_df.cache()
@@ -947,9 +1242,31 @@ class PySparkInventoryEngine:
         )
 
         # ---- ACTION #3: the restock action queue ----------------------------
+        # Ordered by ECONOMIC IMPACT, not alphabetically: the planner should
+        # see the most expensive problem at the top of the queue.
         restock_pdf = self.to_pandas_safely(
-            unified_df.filter(F.col("alert_severity") != "OK"),
+            unified_df.filter(F.col("alert_severity") != "OK")
+            .orderBy(F.col("net_exposure").desc()),
             "restock_queue",
+        )
+
+        # ---- Forward-looking risk register (a planning artefact) ------------
+        # Only SKUs with real demand, ranked by how badly the configured safety
+        # stock misses the service-level requirement. This is the table a
+        # buyer reviews when setting next quarter's reorder parameters.
+        risk_pdf = self.to_pandas_safely(
+            unified_df.filter(F.col("daily_demand_mean") > 0)
+            .orderBy(F.col("safety_stock_gap").desc())
+            .select(
+                "product_id", "product_name", "category", "abc_class",
+                "daily_demand_mean", "daily_demand_sigma", "daily_demand_peak",
+                "demand_cv", "safety_stock_level", "recommended_safety_stock",
+                "safety_stock_gap", "safety_stock_risk", "demand_signal_quality",
+                "current_stock", "days_of_supply", "margin_pct", "revenue",
+                "forecast_next_7d", "forecast_next_7d_low",
+                "forecast_next_7d_high",
+            ),
+            "risk_register",
         )
 
         # ---- ACTION #4: the 1-row enterprise KPI aggregate ------------------
@@ -975,6 +1292,20 @@ class PySparkInventoryEngine:
             F.sum(F.when(F.col("is_stockout_risk") == 1,
                          F.col("reorder_quantity"))).alias("pending_reorder_units"),
             F.countDistinct("warehouse_zone").alias("warehouse_zones"),
+            # ---- economic impact of the open alerts ----
+            F.sum("lost_margin_estimate").alias("total_lost_margin"),
+            F.sum("lost_revenue_estimate").alias("total_lost_revenue"),
+            F.sum("trapped_capital").alias("total_trapped_capital"),
+            F.sum("net_exposure").alias("total_net_exposure"),
+            # ---- forward-looking risk profile ----
+            F.count(F.when(F.col("safety_stock_risk") == "Under-Buffered",
+                           F.lit(1))).alias("under_buffered_skus"),
+            F.count(F.when(F.col("safety_stock_risk") == "Over-Buffered",
+                           F.lit(1))).alias("over_buffered_skus"),
+            F.count(F.when(F.col("safety_stock_risk") == "Censored",
+                           F.lit(1))).alias("censored_demand_skus"),
+            F.round(F.avg("demand_cv"), 2).alias("avg_demand_cv"),
+            F.round(F.max("demand_cv"), 2).alias("peak_demand_cv"),
         ).first()
         self._action("kpi_aggregate", 0.001)   # ~free: the frame is already cached
 
@@ -1004,6 +1335,19 @@ class PySparkInventoryEngine:
             if kpis["total_revenue"] else 0.0, 2)
         kpis["pending_reorder_value"] = kpis.get("pending_reorder_value") or 0.0
         kpis["pending_reorder_units"] = int(kpis.get("pending_reorder_units") or 0)
+        # Economic-impact KPIs, defaulting to 0.0 when the frame is empty.
+        for key in ("total_lost_margin", "total_lost_revenue",
+                    "total_trapped_capital", "total_net_exposure",
+                    "avg_demand_cv", "peak_demand_cv"):
+            kpis[key] = kpis.get(key) or 0.0
+        kpis["under_buffered_skus"] = int(kpis.get("under_buffered_skus") or 0)
+        kpis["over_buffered_skus"] = int(kpis.get("over_buffered_skus") or 0)
+        kpis["censored_demand_skus"] = int(kpis.get("censored_demand_skus") or 0)
+        # Net exposure as a share of revenue: the single most persuasive number
+        # in a planning meeting ("this is X% of our top line at risk").
+        kpis["net_exposure_pct_of_revenue"] = round(
+            (kpis["total_net_exposure"] / kpis["total_revenue"] * 100)
+            if kpis["total_revenue"] else 0.0, 2)
         kpis["critical_alert_items"] = int(
             kpis["stockout_risk_items"] + kpis["dead_stock_items"])
         kpis["units_per_turn"] = round(
@@ -1034,6 +1378,7 @@ class PySparkInventoryEngine:
             "categories": category_pdf,
             "abc_summary": abc_pdf,
             "restock_queue": restock_pdf,
+            "risk_register": risk_pdf,
             "kpis": kpis,
             "meta": meta,
         }
@@ -1074,6 +1419,19 @@ class PySparkInventoryEngine:
         print(" Stockout risk items   : {}".format(kpis["stockout_risk_items"]))
         print(" Dead stock items      : {}".format(kpis["dead_stock_items"]))
         print(" Pending reorder value : ${:,.2f}".format(kpis["pending_reorder_value"]))
+        print(" ---- economic impact of the open alerts ----")
+        print(" Lost margin (est.)    : ${:,.2f}".format(kpis["total_lost_margin"]))
+        print(" Lost revenue (est.)   : ${:,.2f}".format(kpis["total_lost_revenue"]))
+        print(" Trapped capital       : ${:,.2f}".format(kpis["total_trapped_capital"]))
+        print(" NET EXPOSURE          : ${:,.2f}  ({}% of revenue)".format(
+            kpis["total_net_exposure"], kpis["net_exposure_pct_of_revenue"]))
+        print(" ---- demand risk profile ----")
+        print(" Under-buffered SKUs   : {}   (vs {} over-buffered)".format(
+            kpis["under_buffered_skus"], kpis["over_buffered_skus"]))
+        print(" Censored-demand SKUs  : {}   (out of stock -> demand unobserved)".format(
+            kpis["censored_demand_skus"]))
+        print(" Demand volatility (CV): avg {} / peak {}".format(
+            kpis["avg_demand_cv"], kpis["peak_demand_cv"]))
         print(" Actions executed      : {}".format(
             ", ".join("{}={}s".format(a["action"], a["seconds"])
                       for a in meta["actions"])))

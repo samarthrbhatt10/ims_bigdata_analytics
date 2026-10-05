@@ -2,27 +2,39 @@
 # -*- coding: utf-8 -*-
 """
 ===============================================================================
-SMARTSTOCK :: ENTERPRISE DASHBOARD   (main_app.py)
+SMARTSTOCK :: INVENTORY CONTROL TOWER   (main_app.py)
 ===============================================================================
 
-Streamlit front-end for the SmartStock HDFS & PySpark analytics suite.
+An operations console for supply-chain planners. It answers three questions a
+planner actually asks each morning, in order of cost:
 
+    1. WHERE IS THE MONEY LEAKING?      net exposure ($) from open alerts
+    2. WHAT MUST I DO TODAY?           a cost-ranked action queue
+    3. WHICH PARAMETERS ARE WRONG?      safety stock set from demand volatility
+
+DATA FLOW
     HDFS RAW layer (simulated, _SUCCESS committed)
-        -> auto-bootstrap if the layer is not committed
-        -> PySparkInventoryEngine: schema-on-read, groupBy, ABC window, ITR,
-           LEFT ANTI JOIN, broadcast joins, toPandas()  [ACTIONS]
-        -> st.cache_resource: the SparkSession is created ONCE and reused, so
-           every widget interaction costs milliseconds instead of ~20 s
-        -> sidebar filters -> KPI cards -> Plotly charts -> action table
+      -> auto-bootstrap if not committed
+      -> PySparkInventoryEngine: schema-on-read, groupBy, ABC window, turnover,
+         LEFT ANTI JOIN, demand-volatility stats, economic impact, toPandas()
+      -> st.cache_resource: the SparkSession runs ONCE and is reused, so every
+         interaction costs milliseconds instead of a ~14 s Spark job
+      -> this console
 
 WHERE THE WORK HAPPENS
-    Spark   the heavy work: parsing 2,500 typed rows, the groupBy shuffle, the
-            Pareto window, the broadcast joins.
-    Driver  the presentation work: filtering a 60-row Pandas frame and drawing
-            charts.
-    That split is deliberate. A Pandas DataFrame is single-process, so pulling
-    2,500 raw rows to the UI on every slider move would be wasteful, while
-    pulling 2,500 *aggregated* rows would be a design error. We ship 60.
+    Spark   heavy work: 2,500 typed rows parsed, the groupBy shuffle, the
+            Pareto window, the daily-demand re-aggregation, broadcast joins.
+    Driver  presentation: filtering 60 aggregated rows and drawing charts.
+    The split is deliberate. A Pandas frame is single-process, so shipping raw
+    events to the UI per slider move is wasteful, while shipping per-event
+    aggregates would be a design error. We ship 60.
+
+DESIGN PRINCIPLES
+    * Show the number, not the decoration. A planner's screen is dense, not
+      glossy: no gradients on data, colour reserved for STATUS only.
+    * Never publish a confident wrong number. Where the data cannot support a
+      claim (see demand censoring in the engine), the UI says so.
+    * Every headline figure must be traceable to a Spark action.
 ===============================================================================
 """
 
@@ -34,13 +46,12 @@ from typing import Dict, List, Tuple
 import pandas as pd
 import streamlit as st
 
-# Make the project importable no matter where Streamlit is launched from
-# (`streamlit run C:\...\main_app.py` from any directory).
 from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
 
@@ -53,34 +64,56 @@ from hdfs_storage_mock import (
 from pyspark_analytics_engine import PySparkInventoryEngine
 
 # =============================================================================
-# SECTION 1 :: PAGE CONFIG + BRANDING
+# SECTION 1 :: PAGE CONFIG
 # =============================================================================
 
 st.set_page_config(
-    page_title="SmartStock | HDFS & PySpark Inventory Analytics",
-    page_icon="📦",
+    page_title="SmartStock | Inventory Control Tower",
+    page_icon="▦",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-#: Chart fills (donut slices, bars) -- chosen to be distinguishable and
-#: attractive. Every piece of chart TEXT uses CHART_TEXT below, because these
-#: bright colours only fail contrast as foreground, not as a large fill.
-ABC_COLORS = {"A": "#00b894", "B": "#fdcb6e", "C": "#e17055"}
-SEVERITY_COLORS = {
-    "CRITICAL": "#d63031", "HIGH": "#e17055",
-    "MEDIUM": "#fdcb6e", "OK": "#00b894",
-}
-#: Explicit text colour for every axis label, tick and legend entry (13.8:1 on
-#: white). Plotly otherwise inherits Streamlit's theme colour, which is
-#: near-white in dark mode and made the axis labels disappear entirely.
-CHART_TEXT = "#1c2b36"
-#: Gridlines: visible enough to guide the eye, faint enough not to compete.
-CHART_GRID = "#e3e9f0"
-ACCENT = "#1d7874"       # teal - KPI card accent bar
+# ---------------------------------------------------------------------------
+# DESIGN TOKENS
+# ---------------------------------------------------------------------------
+# A deliberately small, semantic palette. Neutral greys do the structural work;
+# colour is reserved for STATUS (critical / warning / ok / neutral) so that a
+# red cell always means "act on this" and never merely "this is a header".
+INK = "#10161c"          # primary text            17.4:1 on white
+INK_MUTED = "#4a5c6a"    # secondary text          7.4:1 on white
+INK_FAINT = "#4a5c6a"    # tertiary / axis labels  7.4:1 on white
+RULE = "#d8e0e8"         # hairlines
+PANEL = "#ffffff"
+CANVAS_TOP = "#f4f6f9"
+CANVAS_BOTTOM = "#e9eef3"
+NAVY = "#0f2a3f"         # app bar                 15.2:1 with white text
+NAVY_SOFT = "#17395a"
 
-#: Default (i.e. "no filter") value of every sidebar widget. Kept in one place
-#: so the reset button can never drift out of sync with the widgets themselves.
+STATUS = {
+    "critical": "#b3261e",   # 6.5:1  -- act now
+    "warning": "#8a5a00",    # 5.9:1  -- act soon
+    "ok": "#0f6b4f",         # 6.0:1  -- healthy
+    "info": "#1d5f8a",       # 6.1:1  -- informational
+    "muted": "#5c6f7d",      # 5.3:1  -- inactive
+}
+#: Class A/B/C are an ORDINAL scale, so they get an ordered blue ramp rather
+#: than three unrelated hues (which read as three different meanings).
+ABC_COLORS = {"A": "#0f3f63", "B": "#2f7ba8", "C": "#8fb4cc"}
+SEVERITY_STATUS = {
+    "CRITICAL": "critical", "HIGH": "critical",
+    "MEDIUM": "warning", "OK": "ok",
+}
+RISK_STATUS = {
+    "Censored": "critical", "Under-Buffered": "critical",
+    "Over-Buffered": "warning", "Aligned": "ok", "No Demand": "muted",
+}
+CHART_TEXT = "#10161c"
+CHART_GRID = "#e4eaf0"
+ACCENT = "#1d5f8a"
+
+#: Default ("no filter") value of every sidebar widget. Kept in one place so the
+#: reset button can never drift out of sync with the widgets themselves.
 FILTER_DEFAULTS: Dict[str, object] = {
     "filter_category": [],
     "filter_abc_class": [],
@@ -95,277 +128,269 @@ def _reset_filters() -> None:
     """on_click callback for the reset button (see the call site)."""
     st.session_state.update(FILTER_DEFAULTS)
 
+
+# =============================================================================
+# SECTION 2 :: STYLESHEET
+# =============================================================================
+# Every text/background pair below clears WCAG AA (4.5:1); most are AAA.
+# The theme is also pinned in .streamlit/config.toml, but a user can flip the
+# theme from the Streamlit menu, so the surface and text colour are forced here
+# rather than inherited.
+
 CSS = """
 <style>
-/* ---------- Global polish ---------- */
-.block-container { padding-top: 2.1rem; padding-bottom: 3rem; max-width: 1500px; }
-
-/* =============================================================================
-   0. THEME OVERRIDE  --  the most important block in this file.
-
-   Streamlit follows the OS dark-mode setting by default. In dark mode it
-   renders body text as #fafafa (near-white). Our page background is LIGHT, so
-   dark mode produced near-white text on a near-white page: the dashboard became
-   unreadable. `.streamlit/config.toml` also pins base="light", but a user can
-   still flip the theme from the Streamlit menu, so we do not rely on that
-   alone -- we force the surface and the text colour here.
-   ============================================================================= */
+/* ---- Theme lock: Streamlit follows the OS dark mode by default, which paints
+   body text near-white and would make this light console unreadable. ---- */
 .stApp, [data-testid="stAppViewContainer"] > .main,
 [data-testid="stMain"], [data-testid="stMain"] > div {
-    background: linear-gradient(180deg, #f7f9fc 0%, #eef2f7 100%) !important;
-    color: #1c2b36 !important;
+    background: linear-gradient(180deg, #f4f6f9 0%, #e9eef3 100%) !important;
+    color: #10161c !important;
 }
-/* Every text node in the main area, including markdown inside tabs and
-   expanders -- which is exactly where the invisible text lived. */
 [data-testid="stMain"] p, [data-testid="stMain"] li,
 [data-testid="stMain"] td, [data-testid="stMain"] th,
 [data-testid="stMain"] span, [data-testid="stMain"] label,
 [data-testid="stMain"] h1, [data-testid="stMain"] h2, [data-testid="stMain"] h3,
-[data-testid="stMain"] h4, [data-testid="stMain"] summary {
-    color: #1c2b36;
-}
-/* Tab labels: the INACTIVE ones were light grey on white and vanished. */
-[data-testid="stTabs"] [role="tab"] { color: #33475a; font-weight: 600; }
-[data-testid="stTabs"] [aria-selected="true"] { color: #0b3c5d; }
+[data-testid="stMain"] h4, [data-testid="stMain"] summary { color: #10161c; }
+[data-testid="stMain"] hr { border-color: #d8e0e8; }
+[data-testid="stCaptionContainer"] { color: #4a5c6a; }
+[data-testid="stTabs"] [role="tab"] { color: #4a5c6a; font-weight: 600; }
+[data-testid="stTabs"] [aria-selected="true"] { color: #0f2a3f; }
 [data-testid="stTabs"] [data-baseweb="tab-highlight"],
-[data-testid="stTabs"] [data-baseweb="tab-border"] { background-color: #1d7874; }
-/* Inline code chips: dark-on-pale so they read in either theme. */
-[data-testid="stMain"] code {
-    background: #e8eef4 !important; color: #0b3c5d !important;
-    border: 1px solid #d3dee8; border-radius: 5px; padding: 0.05em 0.32em;
-}
-/* Markdown tables + rules + captions. */
-[data-testid="stMain"] table { border-color: #dbe4ec; }
-[data-testid="stMain"] table th { color: #0b3c5d; background: #eef3f8; }
-[data-testid="stMain"] table td { color: #1c2b36; border-color: #e3e9f0; }
-[data-testid="stMain"] hr { border-color: #dbe4ec; }
-[data-testid="stCaptionContainer"] { color: #445565; }
-[data-testid="stAlert"] { color: #1c2b36; }
-/* Expander header + the JSON viewer. */
-div[data-testid="stExpander"] details {
-    border: 1px solid #e3e9f0; border-radius: 12px; background: #ffffff; }
-div[data-testid="stExpander"] summary { color: #0b3c5d !important; }
-div[data-testid="stExpander"] summary p { color: #0b3c5d !important; }
+[data-testid="stTabs"] [data-baseweb="tab-border"] { background-color: #1d5f8a; }
+.block-container { padding-top: 1.1rem; padding-bottom: 2.4rem; max-width: 1560px; }
 
-/* ---------- Hero header ---------- */
-.smartstock-hero {
-    /* The gradient deliberately stays in the DARK teal range. Its previous
-       light end (#14b8a6) put the body paragraph at only 2.3:1 against the
-       pale mint text; #145f5c lifts the worst-case stop to 6.75:1 (AAA)
-       while still reading as a navy-to-teal sweep. */
-    background: linear-gradient(115deg, #0b3c5d 0%, #145f5c 100%);
-    padding: 1.5rem 1.9rem; border-radius: 16px; margin-bottom: 1.1rem;
-    box-shadow: 0 10px 28px rgba(11, 60, 93, 0.28);
+/* ---- App bar ------------------------------------------------------------ */
+.appbar {
+    background: #0f2a3f; color: #ffffff; padding: .7rem 1.1rem;
+    border-radius: 8px; margin-bottom: .85rem;
+    display: flex; align-items: center; justify-content: space-between;
+    gap: 1rem; flex-wrap: wrap;
 }
-.smartstock-hero h1 { color: #ffffff; font-size: 2.05rem; margin: 0;
-                      font-weight: 800; letter-spacing: -0.4px; }
-/* #e8f7f4 measures 6.75:1 against the darkest gradient stop and 5.5:1 against
-   the lightest, so the paragraph is readable across its whole width. */
-.smartstock-hero p  { color: #e8f7f4; font-size: 0.95rem; margin: 0.45rem 0 0;
-                      line-height: 1.5; }
-.hero-pills { margin-top: 0.85rem; }
-/* Pills can sit on the LIGHT end of the gradient, so they carry their own
-   pale background and dark text (11.1:1) rather than white-on-teal. */
-.hero-pill {
-    display: inline-block; background: #cdeee9; color: #06323f;
-    border: 1px solid #a8ddd5;
-    border-radius: 999px; padding: 0.2rem 0.75rem;
-    font-size: 0.76rem; margin-right: 0.4rem; font-weight: 600;
+.appbar .brand { font-size: 1.02rem; font-weight: 700; letter-spacing: -.2px;
+                 display: flex; align-items: center; gap: .5rem; }
+.appbar .brand .mark {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 26px; height: 26px; border-radius: 6px; background: #1d5f8a;
+    font-size: .82rem; font-weight: 800;
 }
+.appbar .meta { font-size: .74rem; color: #cfe0ec; display: flex; gap: 1.1rem;
+                flex-wrap: wrap; }
+.appbar .meta b { color: #ffffff; font-weight: 600; }
 
-/* ---------- KPI metric cards ---------- */
-.kpi-card {
-    background: #ffffff; border: 1px solid #e3e9f0; border-radius: 14px;
-    padding: 1.05rem 1.15rem 0.85rem 1.15rem;
-    /* A fixed min-height makes all five cards exactly the same size, so the
-       KPI numbers sit on one horizontal line across the row. */
-    min-height: 196px;
-    box-shadow: 0 3px 12px rgba(16,42,67,0.07);
-    border-top: 4px solid var(--kpi-accent, #1d7874);
-    transition: transform .15s ease, box-shadow .15s ease;
-}
-.kpi-card:hover { transform: translateY(-3px);
-                  box-shadow: 0 8px 20px rgba(16,42,67,0.13); }
-/* All the greys below were re-picked to clear WCAG AA (4.5:1) on white. The
-   previous values measured 2.9:1 and were effectively invisible. */
-.kpi-label { color: #445565; font-size: 0.63rem; font-weight: 700;
-             text-transform: uppercase; letter-spacing: 0.35px;
-             line-height: 1.35; word-break: keep-all; hyphens: none;
-             /* Reserve 4 lines so the KPI VALUES line up across the row,
-                whatever length each label happens to be. */
-             min-height: 5.4em; }
-.kpi-value { color: #0b3c5d; font-size: 1.45rem; font-weight: 800;
-             margin: 0.28rem 0 0.15rem 0; line-height: 1.1;
-             letter-spacing: -0.5px; white-space: nowrap; }
-.kpi-delta { font-size: 0.7rem; font-weight: 600; line-height: 1.4; }
-.kpi-delta.up   { color: #00694f; }
-.kpi-delta.warn { color: #9a4a00; }
-.kpi-delta.bad  { color: #b3261e; }
-.kpi-delta.ok   { color: #445565; }
-.kpi-hint { color: #4f6170; font-size: 0.63rem; line-height: 1.45;
-            margin-top: 0.4rem; border-top: 1px dashed #e3e9f0;
-            padding-top: 0.4rem; }
+/* ---- Section headers ---------------------------------------------------- */
+.sec { display: flex; align-items: baseline; gap: .5rem;
+       margin: 1.35rem 0 .15rem; }
+.sec .num { font-size: .68rem; font-weight: 700; color: #1d5f8a;
+            border: 1px solid #c3d4e0; background: #eaf1f7;
+            border-radius: 4px; padding: .06rem .34rem; }
+.sec h3 { font-size: .98rem; font-weight: 700; color: #0f2a3f;
+          margin: 0; letter-spacing: -.15px; }
+.sec .hint { font-size: .74rem; color: #4a5c6a; margin: .1rem 0 .7rem 0; }
 
-/* ---------- Section headings ---------- */
-.section-head { display: flex; align-items: center; gap: 0.55rem;
-                margin: 1.5rem 0 0.2rem 0; }
-.section-head h3 { color: #0b3c5d; font-size: 1.16rem; margin: 0;
-                   font-weight: 750; }
-.section-head .dot { width: 9px; height: 22px; border-radius: 5px;
-                     background: linear-gradient(180deg,#0b3c5d,#1d7874); }
-.section-sub { color: #445565; font-size: 0.83rem; margin: 0.1rem 0 0.85rem 0; }
+/* ---- Metric tiles ------------------------------------------------------- */
+/* Flat cards, hairline border, no drop shadows: this is a control surface, not
+   a marketing page. A 3px top rule carries the status colour. */
+.tile { background: #ffffff; border: 1px solid #d8e0e8; border-radius: 8px;
+        padding: .78rem .9rem .72rem; height: 100%;
+        border-top: 3px solid var(--tone, #1d5f8a); }
+.tile .lbl { font-size: .63rem; font-weight: 700; letter-spacing: .07em;
+             text-transform: uppercase; color: #4a5c6a; line-height: 1.3;
+             min-height: 2.7em; }
+.tile .val { font-size: 1.5rem; font-weight: 700; color: #0f2a3f;
+             margin: .22rem 0 .1rem; line-height: 1.05; letter-spacing: -.5px;
+             font-variant-numeric: tabular-nums; white-space: nowrap; }
+.tile .sub { font-size: .69rem; font-weight: 600; line-height: 1.4;
+             font-variant-numeric: tabular-nums; }
+/* #4a5c6a (7.4:1) rather than the old #6b7f8f, which measured 4.15:1 here. */
+.tile .foot { font-size: .64rem; color: #4a5c6a; line-height: 1.4;
+              margin-top: .38rem; padding-top: .34rem;
+              border-top: 1px dashed #dfe6ed;
+              font-variant-numeric: tabular-nums; }
+.t-critical { color: #b3261e; } .t-warning { color: #8a5a00; }
+.t-ok { color: #0f6b4f; } .t-info { color: #1d5f8a; } .t-muted { color: #5c6f7d; }
 
-/* ---------- Sidebar (navy, 10.3:1 = AAA) ---------- */
-[data-testid="stSidebar"] { background: linear-gradient(180deg,#0b3c5d 0%,#10496a 100%); }
+/* ---- Status chips (st.markdown only -- see the chip() docstring) --------- */
+.chip { display: inline-block; font-size: .64rem; font-weight: 700;
+        letter-spacing: .05em; text-transform: uppercase;
+        padding: .1rem .4rem; border-radius: 4px; white-space: nowrap; }
+.chip-critical { background: #fbeae9; color: #8c1d16; border: 1px solid #f0c4c0; }
+.chip-warning  { background: #fdf3e0; color: #6d4700; border: 1px solid #edd7a8; }
+.chip-ok       { background: #e6f4ee; color: #0b513b; border: 1px solid #b6ddcd; }
+.chip-info     { background: #e8f1f7; color: #14486a; border: 1px solid #bcd8e8; }
+.chip-muted    { background: #eef2f5; color: #4a5c6a; border: 1px solid #d5dee6; }
+.chip-A { background: #e4ecf3; color: #0f2a3f; border: 1px solid #b9cddd; }
+.chip-B { background: #e9f1f7; color: #1b4c6e; border: 1px solid #c6dbe9; }
+.chip-C { background: #f1f5f8; color: #4a6274; border: 1px solid #d3dfe8; }
+
+/* ---- Sidebar ------------------------------------------------------------ */
+[data-testid="stSidebar"] { background: #0f2a3f; }
 [data-testid="stSidebar"] h1, [data-testid="stSidebar"] h2,
 [data-testid="stSidebar"] h3, [data-testid="stSidebar"] label,
-[data-testid="stSidebar"] p, [data-testid="stSidebar"] li { color: #e8f4f6 !important; }
-[data-testid="stSidebar"] .stMarkdown a { color: #7fe3d8 !important; }
-[data-testid="stSidebar"] hr { border-color: rgba(255,255,255,0.28); }
-/* Sidebar buttons: Streamlit paints them with the LIGHT theme's dark label
-   colour, which left the labels invisible on the navy panel (1.45:1). */
+[data-testid="stSidebar"] p, [data-testid="stSidebar"] li { color: #e6eef4 !important; }
+[data-testid="stSidebar"] .stMarkdown a { color: #7fb8dc !important; }
+[data-testid="stSidebar"] hr { border-color: rgba(255,255,255,.16); }
 [data-testid="stSidebar"] button {
-    color: #e8f4f6 !important;
-    background: rgba(255,255,255,0.10) !important;
-    border: 1px solid rgba(255,255,255,0.34) !important;
-    font-weight: 600;
-}
+    color: #e6eef4 !important; background: rgba(255,255,255,.08) !important;
+    border: 1px solid rgba(255,255,255,.24) !important; font-weight: 600; }
 [data-testid="stSidebar"] button:hover {
-    background: rgba(255,255,255,0.20) !important;
-    border-color: rgba(255,255,255,0.55) !important;
-}
-/* Same problem on the sidebar multiselects / slider / toggle. */
+    background: rgba(255,255,255,.16) !important; }
 [data-testid="stSidebar"] [data-baseweb="select"] > div {
-    background: rgba(255,255,255,0.10) !important;
-    border-color: rgba(255,255,255,0.30) !important;
-}
+    background: rgba(255,255,255,.08) !important;
+    border-color: rgba(255,255,255,.24) !important; }
 [data-testid="stSidebar"] [data-baseweb="tag"] {
-    background: rgba(255,255,255,0.22) !important; color: #ffffff !important; }
+    background: rgba(255,255,255,.20) !important; color: #ffffff !important; }
 [data-testid="stSidebar"] [data-baseweb="tag"] svg { fill: #ffffff !important; }
-[data-testid="stSidebar"] [data-testid="stToggle"] label p { color: #e8f4f6 !important; }
+[data-testid="stSidebar"] [data-testid="stToggle"] label p { color: #e6eef4 !important; }
+.side-title { font-size: 1.05rem; font-weight: 700; color: #ffffff;
+              letter-spacing: -.2px; }
+.side-sub { font-size: .7rem; color: #9dbdd4; margin-top: .1rem; }
+.side-h { font-size: .63rem; font-weight: 700; letter-spacing: .09em;
+          text-transform: uppercase; color: #7fb8dc; margin: .3rem 0 .1rem; }
+.kv { font-size: .73rem; line-height: 1.75; color: #cfe0ec;
+      font-variant-numeric: tabular-nums; }
+.kv b { color: #ffffff; font-weight: 600; }
 
-/* ---------- Misc ---------- */
-.small-note { color: #445565; font-size: 0.78rem; }
-.footer { text-align: center; color: #445565; font-size: 0.75rem;
-          margin-top: 2.2rem; border-top: 1px solid #dbe4ec; padding-top: 0.9rem; }
-.footer code { background: #e8eef4 !important; color: #0b3c5d !important; }
+/* ---- Misc --------------------------------------------------------------- */
+.dataframe-note { font-size: .68rem; color: #4a5c6a; margin: .3rem 0 0; }
+.callout { background: #ffffff; border: 1px solid #d8e0e8;
+           border-left: 3px solid #1d5f8a; border-radius: 6px;
+           padding: .7rem .85rem; font-size: .78rem; color: #10161c;
+           line-height: 1.55; margin: .4rem 0; }
+.callout.warn { border-left-color: #8a5a00; }
+.callout.crit { border-left-color: #b3261e; }
+.callout .ct { font-weight: 700; display: block; margin-bottom: .2rem;
+               color: #0f2a3f; }
+code { background: #eef2f6 !important; color: #0f2a3f !important;
+       border: 1px solid #dbe3ea; border-radius: 4px;
+       padding: .04em .28em; }
+[data-testid="stMain"] table th { color: #0f2a3f; background: #f4f7fa; }
+[data-testid="stMain"] table td { color: #10161c; border-color: #e4eaf0; }
+div[data-testid="stExpander"] details {
+    border: 1px solid #d8e0e8; border-radius: 8px; background: #ffffff; }
+div[data-testid="stExpander"] summary { color: #0f2a3f !important; font-weight: 600; }
+div[data-testid="stExpander"] summary p { color: #0f2a3f !important; }
+.foot-note { text-align: center; color: #4a5c6a; font-size: .68rem;
+             margin-top: 1.6rem; padding-top: .7rem;
+             border-top: 1px solid #d8e0e8; }
 </style>
 """
 st.markdown(CSS, unsafe_allow_html=True)
 
 
 # =============================================================================
-# SECTION 2 :: FORMATTING HELPERS
+# SECTION 3 :: FORMATTING
 # =============================================================================
 
-def fmt_money(value: float, decimals: int = 0) -> str:
-    """1234567.8 -> '$1,234,568'  (defensive: NaN/None -> 'n/a')."""
+def money(value: float, decimals: int = 0) -> str:
     try:
         if value is None or pd.isna(value):
-            return "n/a"
+            return "--"
         return "${:,.{}f}".format(float(value), decimals)
     except (TypeError, ValueError):
-        return "n/a"
+        return "--"
 
 
-def fmt_number(value: float, decimals: int = 0) -> str:
+def num(value: float, decimals: int = 0) -> str:
     try:
         if value is None or pd.isna(value):
-            return "n/a"
+            return "--"
         return "{:,.{}f}".format(float(value), decimals)
     except (TypeError, ValueError):
-        return "n/a"
+        return "--"
 
 
-def kpi_card(label: str, value: str, delta_html: str = "", hint: str = "",
-             accent: str = ACCENT) -> None:
-    """Render one custom KPI card (Streamlit's st.metric cannot be styled)."""
+def compact_money(value: float) -> str:
+    """$1.2M / $43.8K -- for headline tiles where width is tight."""
+    try:
+        if value is None or pd.isna(value):
+            return "--"
+        value = float(value)
+        if abs(value) >= 1_000_000:
+            return "${:,.2f}M".format(value / 1_000_000)
+        if abs(value) >= 1_000:
+            return "${:,.1f}K".format(value / 1_000)
+        return "${:,.0f}".format(value)
+    except (TypeError, ValueError):
+        return "--"
+
+
+def tile(label: str, value: str, sub: str = "", foot: str = "",
+         tone: str = "info") -> None:
+    """One KPI tile. `tone` maps to a status colour on the top rule + sub-text."""
+    colour = STATUS.get(tone, STATUS["info"])
     st.markdown(
         """
-        <div class="kpi-card" style="--kpi-accent:{accent};">
-            <div class="kpi-label">{label}</div>
-            <div class="kpi-value">{value}</div>
-            <div class="kpi-delta {cls}">{delta}</div>
-            <div class="kpi-hint">{hint}</div>
+        <div class="tile" style="--tone:{colour};">
+          <div class="lbl">{label}</div>
+          <div class="val">{value}</div>
+          <div class="sub t-{tone}">{sub}</div>
+          <div class="foot">{foot}</div>
         </div>
-        """.format(
-            accent=accent, label=label, value=value,
-            delta=delta_html or "&nbsp;", cls=_delta_class(delta_html),
-            hint=hint or "&nbsp;",
-        ),
+        """.format(colour=colour, tone=tone, label=label, value=value,
+                   sub=sub or "&nbsp;", foot=foot or "&nbsp;"),
         unsafe_allow_html=True,
     )
 
 
-def _delta_class(delta_html: str) -> str:
-    lowered = (delta_html or "").lower()
-    for token, css_class in (("critical", "bad"), ("risk", "bad"),
-                             ("low", "bad"), ("warn", "warn"),
-                             ("good", "up"), ("healthy", "up"),
-                             ("dead", "warn"), ("high", "warn")):
-        if token in lowered:
-            return css_class
-    return "ok"
-
-
-def section_head(icon: str, title: str, subtitle: str = "") -> None:
-    """A consistent section heading with a coloured accent bar."""
+def section(number: str, title: str, hint: str = "") -> None:
     st.markdown(
-        '<div class="section-head"><span class="dot"></span>'
-        '<h3>{} {}</h3></div>'.format(icon, title),
+        '<div class="sec"><span class="num">{}</span><h3>{}</h3></div>'
+        '<div class="hint">{}</div>'.format(number, title, hint),
         unsafe_allow_html=True,
     )
-    if subtitle:
-        st.markdown('<div class="section-sub">{}</div>'.format(subtitle),
-                    unsafe_allow_html=True)
+
+
+def chip(text: str, kind: str = "muted") -> str:
+    """Status chip as HTML.
+
+    NOTE: only valid inside st.markdown. st.dataframe renders through a
+    sanitising grid, which strips the markup -- table cells therefore use a
+    plain-text glyph prefix instead. Keeping both paths documented avoids
+    someone "fixing" a table that silently loses its colour.
+    """
+    return '<span class="chip chip-{}">{}</span>'.format(kind, text)
 
 
 # =============================================================================
-# SECTION 3 :: DATA BOOTSTRAP + SPARK PIPELINE (cached)
+# SECTION 4 :: DATA BOOTSTRAP + SPARK PIPELINE (cached)
 # =============================================================================
 
 def bootstrap_hdfs_layer() -> Dict[str, object]:
     """Ensure the simulated HDFS RAW layer is committed before Spark reads it.
 
-    `hdfs_dataset_exists()` checks BOTH the data files and the Hadoop
-    `_SUCCESS` markers, so we never read a half-written dataset.  This is the
-    "data self-service" contract: the dashboard heals its own upstream.
+    `hdfs_dataset_exists()` checks both the data files and the Hadoop
+    `_SUCCESS` markers, so we never read a half-written dataset.
     """
     if not hdfs_dataset_exists():
-        with st.spinner("HDFS RAW layer empty - generating the simulated "
+        with st.spinner("HDFS RAW layer empty -- generating the simulated "
                         "dataset (products / stock / sales ledger) ..."):
             return ensure_hdfs_dataset()
     return read_manifest()
 
 
-@st.cache_resource(show_spinner="Running the PySpark distributed pipeline "
+@st.cache_resource(show_spinner="Running the PySpark pipeline "
                                "(first run also starts the Spark JVM) ...")
 def load_pipeline() -> Dict[str, object]:
-    """Execute the Spark pipeline ONCE and cache the result for the session.
+    """Execute the Spark pipeline ONCE and cache it for the session.
 
-    st.cache_resource (not st.cache_data) is the right decorator because we
-    want to KEEP the PySparkInventoryEngine instance -- and therefore its
-    SparkContext/JVM -- alive between reruns.  A filter interaction then only
-    re-runs the cheap Pandas layer, so the UI stays responsive.
+    st.cache_resource (not st.cache_data) keeps the engine instance -- and so
+    its SparkContext/JVM -- alive between reruns, which is why filtering is
+    instant rather than costing a fresh ~14 s Spark job.
     """
     bootstrap_hdfs_layer()
     engine = PySparkInventoryEngine(verbose=True)
     results = engine.run_pipeline()
-    results["engine"] = engine          # keep it cached -> keep the JVM alive
+    results["engine"] = engine
     return results
 
 
-def rollup_slice(products: pd.DataFrame
-                 ) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str, float]]:
-    """Derive the category & ABC rollups for the CURRENTLY FILTERED slice.
+def rollup(products: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str, float]]:
+    """Recompute the category / ABC rollups for the CURRENTLY FILTERED slice.
 
-    Why recompute in Pandas instead of re-running Spark on every slider move?
-    Because the slice is at most 60 rows -- the equivalent of a lookup table.
-    Spark is a batch engine; re-submitting a 60-row job per interaction would
-    add ~10 s of scheduling latency for no benefit.  The architectural rule:
-    distributed engine for volume, in-memory engine for interactivity.  When
-    NO filter is active we use the Spark pre-aggregates shipped by the engine
-    (see `build_dashboard_data`) so the default view is 100% Spark-computed.
+    The slice is at most 60 rows -- effectively a lookup table -- so rolling it
+    up in Pandas costs microseconds. Re-submitting a Spark job per slider move
+    would add seconds of scheduling latency for no benefit. The rule:
+    distributed engine for volume, in-memory engine for interactivity.
     """
     categories = (
         products.groupby("category", as_index=False)
@@ -374,6 +399,7 @@ def rollup_slice(products: pd.DataFrame
              cogs=("cogs", "sum"),
              units_sold=("units_sold", "sum"),
              inventory_value=("inventory_value", "sum"),
+             net_exposure=("net_exposure", "sum"),
              dead_stock_items=("is_dead_stock", "sum"),
              stockout_items=("is_stockout_risk", "sum"))
         .sort_values("revenue", ascending=False)
@@ -383,555 +409,621 @@ def rollup_slice(products: pd.DataFrame
         .agg(sku_count=("product_id", "count"),
              revenue=("revenue", "sum"),
              inventory_value=("inventory_value", "sum"),
-             dead_stock_items=("is_dead_stock", "sum"),
-             stockout_items=("is_stockout_risk", "sum"))
+             net_exposure=("net_exposure", "sum"))
         .sort_values("abc_class")
     )
     totals = {
         "revenue": float(products["revenue"].sum()),
         "cogs": float(products["cogs"].sum()),
+        "margin": float(products["margin"].sum()),
         "inventory_value": float(products["inventory_value"].sum()),
-        "average_inventory_value": float(products["average_inventory_value"].sum()),
+        "avg_inventory_value": float(products["average_inventory_value"].sum()),
+        "net_exposure": float(products["net_exposure"].sum()),
+        "lost_margin": float(products["lost_margin_estimate"].sum()),
+        "lost_revenue": float(products["lost_revenue_estimate"].sum()),
+        "trapped": float(products["trapped_capital"].sum()),
+        "reorder_value": float(products["reorder_value"].sum()),
         "stockout": int(products["is_stockout_risk"].sum()),
         "dead": int(products["is_dead_stock"].sum()),
+        "under_buffered": int((products["safety_stock_risk"] == "Under-Buffered").sum()),
+        "over_buffered": int((products["safety_stock_risk"] == "Over-Buffered").sum()),
+        "censored": int((products["safety_stock_risk"] == "Censored").sum()),
+        "avg_cv": float(products["demand_cv"].mean()) if len(products) else 0.0,
     }
     return categories, abc, totals
 
 
 # =============================================================================
-# SECTION 4 :: SIDEBAR  (filters + system status)
+# SECTION 5 :: SIDEBAR
 # =============================================================================
 
 def render_sidebar(products: pd.DataFrame, meta: Dict[str, object]
                    ) -> Dict[str, object]:
-    """All dashboard filters live here.  Returns the active filter state."""
     st.sidebar.markdown(
-        """
-        <div style="margin-bottom:.4rem;">
-          <div style="font-size:1.28rem;font-weight:800;color:#fff;letter-spacing:-.3px;">
-            📦 SmartStock</div>
-          <div style="font-size:.76rem;color:#9fd8d2;">HDFS × PySpark Analytics</div>
-        </div>
-        """,
+        '<div class="side-title">▦ SmartStock</div>'
+        '<div class="side-sub">Inventory Control Tower &middot; HDFS × PySpark</div>',
         unsafe_allow_html=True,
     )
     st.sidebar.markdown("---")
 
-    st.sidebar.subheader("🔎 Filters")
-
-    # Every filter widget gets an explicit session-state key. That is what makes
-    # the "Reset all filters" button below able to restore the defaults:
-    # Streamlit only lets you programmatically change a widget's value if you
-    # can address it by key.
-    #
-    # Streamlit idiom: an EMPTY multiselect means "no filter" (show everything).
+    st.sidebar.markdown('<div class="side-h">Filters</div>', unsafe_allow_html=True)
     selected_categories = st.sidebar.multiselect(
-        "Product Category",
-        options=sorted(products["category"].unique()),
-        default=[],
-        placeholder="All categories",
-        key="filter_category",
-    )
+        "Category", options=sorted(products["category"].unique()),
+        default=[], placeholder="All categories", key="filter_category")
     selected_classes = st.sidebar.multiselect(
-        "ABC Inventory Class",
-        options=["A", "B", "C"],
-        default=[],
-        placeholder="All classes (A / B / C)",
-        key="filter_abc_class",
-    )
+        "ABC class", options=["A", "B", "C"], default=[],
+        placeholder="All classes", key="filter_abc_class")
     selected_zones = st.sidebar.multiselect(
-        "Warehouse Zone",
-        options=sorted(products["warehouse_zone"].dropna().unique()),
-        default=[],
-        placeholder="All zones",
-        key="filter_zone",
-    )
+        "Warehouse zone", options=sorted(products["warehouse_zone"].dropna().unique()),
+        default=[], placeholder="All zones", key="filter_zone")
     selected_severities = st.sidebar.multiselect(
-        "Alert Severity",
-        options=["CRITICAL", "HIGH", "MEDIUM", "OK"],
-        default=[],
-        placeholder="All severities",
-        key="filter_severity",
-    )
+        "Alert severity", options=["CRITICAL", "HIGH", "MEDIUM", "OK"],
+        default=[], placeholder="All severities", key="filter_severity")
     min_revenue = st.sidebar.slider(
-        "Minimum SKU revenue ($)", min_value=0,
+        "Minimum SKU revenue", min_value=0,
         max_value=int(max(products["revenue"].max(), 1)),
-        value=0, step=500,
-        key="filter_min_revenue",
-    )
+        value=0, step=500, key="filter_min_revenue")
     only_alerts = st.sidebar.toggle(
-        "Show only items needing action", value=False,
-        help="Hides fully healthy SKUs (alert_severity == OK).",
-        key="filter_only_alerts",
-    )
+        "Flagged SKUs only", value=False,
+        help="Hides SKUs whose alert severity is OK.", key="filter_only_alerts")
 
-    # `on_click` is essential here, not decorative: a callback runs BEFORE the
-    # widgets are re-instantiated on the next run, which is the only legal
-    # moment to write to a widget's session state. Setting the same keys from
-    # inside the script body raises
-    # "cannot be modified after the widget with key ... is instantiated".
-    st.sidebar.button("↺ Reset all filters", on_click=_reset_filters,
+    # on_click (not an inline assignment) because a callback runs BEFORE the
+    # widgets are re-instantiated, which is the only legal moment to write to
+    # a widget's session state.
+    st.sidebar.button("Reset all filters", on_click=_reset_filters,
                       width="stretch")
 
-    # ---------------- system status panel ----------------
+    # ---------------- data freshness / provenance ----------------
     st.sidebar.markdown("---")
-    st.sidebar.subheader("🖥️ System status")
+    st.sidebar.markdown('<div class="side-h">Pipeline</div>', unsafe_allow_html=True)
     ingestion = meta.get("ingestion", {}) or {}
     st.sidebar.markdown(
-        """
-        <div style="font-size:.8rem;line-height:1.85;">
-          <b>Spark</b> {}<br>
-          <b>Master</b> {}<br>
-          <b>Shuffle partitions</b> {}<br>
-          <b>Sales window</b> {} days<br>
-          <b>Transactions ingested</b> {}<br>
-          <b>Pipeline wall clock</b> {}s
-        </div>
-        """.format(
+        '<div class="kv">'
+        '<b>Spark</b> {}<br>'
+        '<b>Engine</b> {}<br>'
+        '<b>Shuffle parts</b> {}<br>'
+        '<b>Window</b> {} days<br>'
+        '<b>Events read</b> {}<br>'
+        '<b>Actions</b> {}<br>'
+        '<b>Wall clock</b> {}s'
+        '</div>'.format(
             meta.get("spark_version"), meta.get("spark_master"),
             meta.get("shuffle_partitions"), meta.get("sales_window_days"),
-            fmt_number(ingestion.get("sales_ledger_rows")),
+            num(ingestion.get("sales_ledger_rows")),
+            len(meta.get("actions", []) or []),
             meta.get("total_seconds"),
         ),
         unsafe_allow_html=True,
     )
 
-    if st.sidebar.button("♻️ Regenerate HDFS dataset", width="stretch"):
+    st.sidebar.markdown(
+        '<div class="side-h">Actions</div>', unsafe_allow_html=True)
+    if st.sidebar.button("Regenerate HDFS dataset", width="stretch"):
         with st.spinner("Regenerating the simulated HDFS RAW layer ..."):
             ensure_hdfs_dataset(force=True)
-        # Drop the cached pipeline so the next render re-runs Spark on the
-        # fresh data.  This is the correct invalidation order: data first,
-        # then the cache key.
+        # Invalidation order matters: write the data first, then drop the cache.
         st.cache_resource.clear()
-        st.sidebar.success("Dataset regenerated.")
         st.rerun()
 
     return {
-        "categories": selected_categories,
-        "classes": selected_classes,
-        "zones": selected_zones,
-        "severities": selected_severities,
-        "min_revenue": min_revenue,
-        "only_alerts": only_alerts,
+        "categories": selected_categories, "classes": selected_classes,
+        "zones": selected_zones, "severities": selected_severities,
+        "min_revenue": min_revenue, "only_alerts": only_alerts,
     }
 
 
-def apply_filters(products: pd.DataFrame, filters: Dict[str, object]
-                  ) -> pd.DataFrame:
-    """Slice the 60-row Pandas frame.  Empty list == no filter (show all)."""
+def apply_filters(products: pd.DataFrame, f: Dict[str, object]) -> pd.DataFrame:
+    """Slice the 60-row frame. An empty selection means 'no filter'."""
     mask = pd.Series(True, index=products.index)
-
-    if filters["categories"]:
-        mask &= products["category"].isin(filters["categories"])
-    if filters["classes"]:
-        mask &= products["abc_class"].isin(filters["classes"])
-    if filters["zones"]:
-        mask &= products["warehouse_zone"].isin(filters["zones"])
-    if filters["severities"]:
-        mask &= products["alert_severity"].isin(filters["severities"])
-    if filters["min_revenue"]:
-        mask &= products["revenue"] >= float(filters["min_revenue"])
-    if filters["only_alerts"]:
+    if f["categories"]:
+        mask &= products["category"].isin(f["categories"])
+    if f["classes"]:
+        mask &= products["abc_class"].isin(f["classes"])
+    if f["zones"]:
+        mask &= products["warehouse_zone"].isin(f["zones"])
+    if f["severities"]:
+        mask &= products["alert_severity"].isin(f["severities"])
+    if f["min_revenue"]:
+        mask &= products["revenue"] >= float(f["min_revenue"])
+    if f["only_alerts"]:
         mask &= products["alert_severity"] != "OK"
-
     return products[mask].copy()
 
 
 # =============================================================================
-# SECTION 5 :: KPI ROW
+# SECTION 6 :: CHART HELPERS
 # =============================================================================
 
-def render_kpi_row(totals: Dict[str, float], kpis: Dict[str, object],
-                   sku_count: int, total_skus: int, filtered: bool) -> None:
-    """The four required KPI cards (+ a fifth commercial one)."""
-    avg_inventory = totals["average_inventory_value"] or 0.0
-    itr_period = (totals["cogs"] / avg_inventory) if avg_inventory else 0.0
-    window_days = int(kpis.get("sales_window_days") or 90) or 90
-    itr_annual = itr_period * (365.0 / window_days)
-    scope = "filtered slice" if filtered else "enterprise"
-
-    # Weighted columns: the revenue figure is the widest string, the SKU
-    # counter the narrowest, so the cards get proportional room.
-    columns = st.columns([1.25, 1.0, 0.95, 1.05, 0.9], gap="small")
-
-    with columns[0]:
-        kpi_card(
-            "Total Enterprise Revenue ($)",
-            fmt_money(totals["revenue"]),
-            "{:.1f}% gross margin".format(
-                (totals["revenue"] - totals["cogs"]) / totals["revenue"] * 100
-                if totals["revenue"] else 0.0),
-            "COGS {} · {} scope".format(fmt_money(totals["cogs"]), scope),
-            accent="#0b3c5d",
-        )
-    with columns[1]:
-        kpi_card(
-            "Critical Stockout Reorder Alerts",
-            fmt_number(totals["stockout"]),
-            "on-hand ≤ safety level" if totals["stockout"] else "All buffers healthy",
-            "Replenishment value {}".format(
-                fmt_money(kpis.get("pending_reorder_value", 0))),
-            accent="#d63031" if totals["stockout"] else "#00b894",
-        )
-    with columns[2]:
-        kpi_card(
-            "Dead Stock Items Found",
-            fmt_number(totals["dead"]),
-            "no sales in {} days".format(window_days) if totals["dead"]
-            else "No dead stock found",
-            "Capital frozen · markdown",
-            accent="#e17055" if totals["dead"] else "#00b894",
-        )
-    with columns[3]:
-        kpi_card(
-            "Overall Inventory Turnover Ratio",
-            "{:.2f}x".format(itr_annual),
-            "{:.2f}x over the {}d window".format(itr_period, window_days),
-            "COGS ÷ avg inventory value",
-            accent="#1d7874",
-        )
-    with columns[4]:
-        kpi_card(
-            "SKUs in Scope",
-            "{} / {}".format(sku_count, total_skus),
-            "class A drives 80% of revenue",
-            "Stock value {}".format(fmt_money(totals["inventory_value"])),
-            accent="#6c5ce7",
-        )
-
-
-# =============================================================================
-# SECTION 6 :: VISUAL ANALYTICS
-# =============================================================================
-
-def chart_revenue_by_category(categories: pd.DataFrame) -> None:
-    """Horizontal bar: revenue generated per product category (REQUIRED #1)."""
-    ordered = categories.sort_values("revenue", ascending=True)
-    figure = px.bar(
-        ordered, x="revenue", y="category", orientation="h",
-        color="revenue", color_continuous_scale=["#9fd8d2", "#0b3c5d"],
-        text=ordered["revenue"].map(lambda v: fmt_money(v)),
-        labels={"revenue": "Revenue generated ($)", "category": ""},
-        custom_data=["sku_count", "units_sold", "inventory_value"],
-        title=None,
-    )
-    figure.update_traces(
-        textposition="outside", textfont_size=11,
-        textfont_color=CHART_TEXT,          # value labels sit on white
-        hovertemplate=(
-            "<b>%{y}</b><br>Revenue: $%{x:,.2f}<br>"
-            "SKUs: %{customdata[0]}<br>Units sold: %{customdata[1]}<br>"
-            "Inventory value: $%{customdata[2]:,.2f}<extra></extra>"),
-        marker_line_width=0,
-    )
-    figure.update_layout(
-        height=380, margin=dict(l=10, r=90, t=10, b=10),
-        xaxis_title=None, yaxis_title=None, showlegend=False,
-        plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
+def _base_layout(height: int, **kwargs) -> dict:
+    layout = dict(
+        height=height, margin=dict(t=12, b=12, l=8, r=8),
         font=dict(family="Source Sans Pro, Segoe UI, sans-serif",
                   size=12, color=CHART_TEXT),
-        xaxis=dict(tickfont=dict(color=CHART_TEXT), showgrid=True,
-                   gridcolor=CHART_GRID, zeroline=False),
-        yaxis=dict(tickfont=dict(color=CHART_TEXT), showgrid=False),
+        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+        hoverlabel=dict(font_size=12),
     )
-    st.plotly_chart(figure, width="stretch",
-                    config={"displayModeBar": False})
+    layout.update(kwargs)
+    return layout
+
+
+def chart_revenue_by_category(categories: pd.DataFrame) -> None:
+    """Horizontal bars: revenue by category. Ordered ascending so the largest
+    category sits at the top, which is how every finance deck reads a bar chart."""
+    ordered = categories.sort_values("revenue", ascending=True)
+    colours = [ABC_COLORS["A"]] * len(ordered)
+    figure = go.Figure(go.Bar(
+        x=ordered["revenue"], y=ordered["category"], orientation="h",
+        marker=dict(color=colours, line=dict(width=0)),
+        text=[compact_money(v) for v in ordered["revenue"]],
+        textposition="outside", textfont=dict(size=11, color=CHART_TEXT),
+        customdata=np.c_[ordered["sku_count"], ordered["units_sold"],
+                         ordered["inventory_value"], ordered["net_exposure"]],
+        hovertemplate=(
+            "<b>%{y}</b><br>Revenue $%{x:,.0f}<br>SKUs %{customdata[0]}"
+            "<br>Units sold %{customdata[1]:,.0f}"
+            "<br>Inventory $%{customdata[2]:,.0f}"
+            "<br>Net exposure $%{customdata[3]:,.0f}<extra></extra>"),
+        showlegend=False,
+    ))
+    figure.update_layout(**_base_layout(
+        330, xaxis=dict(tickfont=dict(color=CHART_TEXT), gridcolor=CHART_GRID,
+                        tickprefix="$", separatethousands=True),
+        yaxis=dict(tickfont=dict(color=CHART_TEXT), showgrid=False),
+        bargap=0.35))
+    st.plotly_chart(figure, width="stretch", config={"displayModeBar": False})
+
+
+def chart_exposure_by_sku(products: pd.DataFrame) -> None:
+    """The money chart: net exposure by SKU, split into lost margin vs trapped
+    capital. A stacked bar makes the two failure modes comparable at a glance
+    -- they need opposite decisions (buy more vs liquidate)."""
+    flagged = products[products["net_exposure"] > 0].copy()
+    if flagged.empty:
+        st.success("No economic exposure in the current selection.")
+        return
+    flagged = flagged.sort_values("net_exposure").tail(12)
+    figure = go.Figure()
+    figure.add_bar(
+        y=flagged["product_id"], x=flagged["lost_margin_estimate"],
+        name="Lost margin (stockout)", orientation="h",
+        marker=dict(color=STATUS["critical"], line=dict(width=0)),
+        hovertemplate="<b>%{y}</b><br>Lost margin $%{x:,.0f}<extra></extra>")
+    figure.add_bar(
+        y=flagged["product_id"], x=flagged["trapped_capital"],
+        name="Trapped capital (dead stock)", orientation="h",
+        marker=dict(color="#c9a227", line=dict(width=0)),
+        hovertemplate="<b>%{y}</b><br>Trapped capital $%{x:,.0f}<extra></extra>")
+    figure.update_layout(**_base_layout(
+        330, barmode="stack", showlegend=True,
+        legend=dict(orientation="h", y=1.16, x=0,
+                    font=dict(size=10.5, color=CHART_TEXT)),
+        xaxis=dict(tickfont=dict(color=CHART_TEXT), gridcolor=CHART_GRID,
+                   tickprefix="$", separatethousands=True,
+                   title=dict(text="Net exposure ($)",
+                              font=dict(color=CHART_TEXT))),
+        # Title colour set explicitly: Plotly axis titles do NOT inherit the
+        # layout font, so they fall back to a mid-grey that measures 3.7:1.
+        yaxis=dict(tickfont=dict(color=CHART_TEXT), showgrid=False,
+                   title=dict(text="SKU", font=dict(color=CHART_TEXT)))))
+    st.plotly_chart(figure, width="stretch", config={"displayModeBar": False})
+
+
+def chart_buffer_gap(products: pd.DataFrame) -> None:
+    """Diverging bars: configured safety stock vs the statistical requirement.
+
+    Bars left of zero are over-buffered (cash sitting on the shelf); bars right
+    of zero are under-buffered (stockout risk). NULL gaps (demand-censored
+    SKUs) are deliberately excluded -- see the callout under the chart.
+    """
+    valid = products[products["safety_stock_gap"].notna()].copy()
+    censored = int((products["safety_stock_risk"] == "Censored").sum())
+    if valid.empty:
+        st.info("No SKUs with a usable demand signal in this selection.")
+        return
+    valid = valid.sort_values("safety_stock_gap").tail(14)
+    colours = [STATUS["critical"] if g > 0 else "#4a5c6a"
+               for g in valid["safety_stock_gap"]]
+    figure = go.Figure(go.Bar(
+        x=valid["safety_stock_gap"], y=valid["product_id"], orientation="h",
+        marker=dict(color=colours, line=dict(width=0)),
+        text=[num(v) for v in valid["safety_stock_gap"]],
+        textposition="outside", textfont=dict(size=10.5, color=CHART_TEXT),
+        customdata=np.c_[valid["safety_stock_level"],
+                         valid["recommended_safety_stock"],
+                         valid["demand_cv"]],
+        hovertemplate=(
+            "<b>%{y}</b><br>Gap %{x:,.0f} units"
+            "<br>Configured %{customdata[0]:,.0f}"
+            "<br>Recommended %{customdata[1]:,.0f}"
+            "<br>Demand CV %{customdata[2]:.2f}<extra></extra>"),
+        showlegend=False))
+    figure.add_vline(x=0, line_width=1.4, line_color="#10161c")
+    figure.update_layout(**_base_layout(
+        330, xaxis=dict(tickfont=dict(color=CHART_TEXT), gridcolor=CHART_GRID,
+                        title=dict(text="Safety stock gap (units)  "
+                                         "[over-buffered | under-buffered]",
+                                   font=dict(color=CHART_TEXT))),
+        yaxis=dict(tickfont=dict(color=CHART_TEXT), showgrid=False,
+                   title=dict(text="SKU", font=dict(color=CHART_TEXT))),
+        bargap=0.35))
+    st.plotly_chart(figure, width="stretch", config={"displayModeBar": False})
+    if censored:
+        st.markdown(
+            '<div class="callout warn"><span class="ct">Demand censoring</span>'
+            '{} SKU(s) in this selection are currently at or below their safety '
+            'level. While out of stock they record no demand at all, so their '
+            'observed mean is biased low and the statistical recommendation is '
+            'unreliable. Those SKUs are reported as <b>Censored</b> and excluded '
+            'from this chart rather than given a confident but wrong number.'
+            '</div>'.format(censored),
+            unsafe_allow_html=True)
+
+
+def chart_volatility_vs_revenue(products: pd.DataFrame) -> None:
+    """Scatter: demand volatility (CV) against revenue contribution.
+
+    Colour = ABC class, marker size = current stock. The interesting population
+    is the upper-right: high-value SKUs whose demand is also erratic, because
+    those are the ones a static safety level cannot protect.
+    """
+    live = products[products["daily_demand_mean"] > 0].copy()
+    if live.empty:
+        st.info("No SKUs with demand in this selection.")
+        return
+    figure = px.scatter(
+        live, x="demand_cv", y="revenue",
+        color="abc_class", size="current_stock", size_max=34,
+        color_discrete_map=ABC_COLORS,
+        # "ABC" as an axis title is set explicitly in the layout below, because
+        # Plotly legend/axis titles ignore the layout font colour.
+        labels={"demand_cv": "Demand volatility (coefficient of variation)",
+                "revenue": "Revenue ($)", "abc_class": "",
+                "current_stock": "On hand"},
+        custom_data=["product_id", "product_name", "safety_stock_risk",
+                     "safety_stock_gap"],
+    )
+    figure.update_traces(
+        marker=dict(opacity=0.82, line=dict(width=1, color="#ffffff")),
+        hovertemplate=(
+            "<b>%{customdata[0]}</b> %{customdata[1]}"
+            "<br>ABC %{color} &middot; CV %{x:.2f}"
+            "<br>Revenue $%{y:,.0f}"
+            "<br>Buffer risk %{customdata[2]}<extra></extra>"))
+    figure.update_layout(**_base_layout(
+        330, showlegend=True,
+        legend=dict(orientation="h", y=1.16, x=0,
+                    font=dict(size=10.5, color=CHART_TEXT)),
+        xaxis=dict(tickfont=dict(color=CHART_TEXT), gridcolor=CHART_GRID,
+                   title=dict(text="Demand volatility (CV) — less predictable",
+                              font=dict(color=CHART_TEXT))),
+        yaxis=dict(tickfont=dict(color=CHART_TEXT), gridcolor=CHART_GRID,
+                   tickprefix="$", separatethousands=True,
+                   title=dict(text="Revenue ($) — more valuable",
+                              font=dict(color=CHART_TEXT)))))
+    st.plotly_chart(figure, width="stretch", config={"displayModeBar": False})
 
 
 def chart_abc_distribution(abc: pd.DataFrame) -> None:
-    """Donut: percentage breakdown of class A / B / C stock items (REQUIRED #3)."""
+    """Donut: SKU share by ABC class. The planning rule of thumb behind it is
+    that class A deserves the management attention and class C the shelf space."""
     figure = go.Figure(go.Pie(
         labels=abc["abc_class_label"], values=abc["sku_count"],
-        hole=0.55, sort=False, direction="clockwise",
+        hole=0.56, sort=False, direction="clockwise",
         marker=dict(colors=[ABC_COLORS.get(c, "#8395a7") for c in abc["abc_class"]],
                     line=dict(color="#ffffff", width=2)),
-        textinfo="label+percent",
-        # Slice labels sit on the white page, not on the coloured slice.
-        textfont=dict(size=12, color=CHART_TEXT),
-        hovertemplate="<b>%{label}</b><br>SKUs: %{value}<br>"
-                      "Share: %{percent}<extra></extra>",
-    ))
-    total_skus = int(abc["sku_count"].sum())
+        textinfo="label+percent", textfont=dict(size=11.5, color=CHART_TEXT),
+        hovertemplate="<b>%{label}</b><br>SKUs %{value}"
+                      "<br>%{percent} of catalogue<extra></extra>"))
     figure.add_annotation(
-        text="<b>{}</b><br>SKUs".format(total_skus),
-        x=0.5, y=0.5, showarrow=False, font=dict(size=15, color="#0b3c5d"),
-    )
-    figure.update_layout(
-        height=380, margin=dict(t=10, b=10, l=10, r=10), showlegend=True,
-        font=dict(color=CHART_TEXT),
-        legend=dict(orientation="h", yanchor="bottom", y=-0.12, x=0.5,
-                    xanchor="center", font=dict(size=11, color=CHART_TEXT)),
-        paper_bgcolor="rgba(0,0,0,0)",
-    )
-    st.plotly_chart(figure, width="stretch",
-                    config={"displayModeBar": False})
+        text="<b>{}</b><br>SKUs".format(int(abc["sku_count"].sum())),
+        x=0.5, y=0.5, showarrow=False, font=dict(size=14, color="#0f2a3f"))
+    figure.update_layout(**_base_layout(
+        330, margin=dict(t=10, b=10), showlegend=True,
+        legend=dict(orientation="h", y=-0.1, x=0.5, xanchor="center",
+                    font=dict(size=10.5, color=CHART_TEXT))))
+    st.plotly_chart(figure, width="stretch", config={"displayModeBar": False})
 
 
-def chart_pareto_curve(products: pd.DataFrame) -> None:
-    """Pareto: bar = revenue per SKU, line = cumulative revenue %.
-
-    Visual proof of the ABC cut done by the Spark window function: the line
-    crosses 80% and 95% exactly where the classes change.
-    """
-    ordered = products.sort_values("revenue", ascending=False).head(25).copy()
-    ordered["cumulative_pct"] = (
-        ordered["revenue"].cumsum() / ordered["revenue"].sum() * 100
-        if ordered["revenue"].sum() else 0.0
-    )
+def chart_turnover_by_category(categories: pd.DataFrame) -> None:
+    """Grouped bars: inventory value against revenue, per category. A category
+    holding a lot of stock but generating little revenue is where capital is
+    being trapped, and this is how a planner spots it in one glance."""
+    ordered = categories.sort_values("inventory_value", ascending=False)
     figure = go.Figure()
     figure.add_bar(
-        x=ordered["product_id"], y=ordered["revenue"], name="SKU revenue",
-        marker_color=[ABC_COLORS.get(c, "#8395a7") for c in ordered["abc_class"]],
-        hovertemplate="<b>%{x}</b><br>Revenue: $%{y:,.2f}<extra></extra>",
-    )
-    figure.add_scatter(
-        x=ordered["product_id"], y=ordered["cumulative_pct"],
-        name="Cumulative revenue %", mode="lines+markers",
-        line=dict(color="#d63031", width=2.5, shape="hv"),
-        marker=dict(size=4),
-        yaxis="y2",
-        hovertemplate="Cumulative: %{y:.1f}%<extra></extra>",
-    )
-    # Threshold lines use the DARK variants of the ABC colours, not the bright
-    # fills: as annotation TEXT the bright amber measured only 1.5:1 on white.
-    # The bars keep the bright palette, because a large filled area is not a
-    # contrast failure.
-    for threshold, colour in ((80, "#007a5c"), (95, "#8a5a00")):
-        figure.add_hline(y=threshold, line_dash="dash", line_color=colour,
-                         annotation_text="{}%".format(threshold),
-                         annotation_position="top left",
-                         annotation_font=dict(size=10, color=colour))
-    figure.update_layout(
-        height=400, barmode="overlay", margin=dict(t=15, b=10, l=10, r=10),
-        font=dict(color=CHART_TEXT),
-        xaxis=dict(title="SKU (top 25 by revenue)", tickangle=-60,
-                   tickfont=dict(size=9, color=CHART_TEXT), showgrid=False),
-        yaxis=dict(title="Revenue ($)", tickfont=dict(color=CHART_TEXT),
-                   gridcolor=CHART_GRID),
-        yaxis2=dict(title="Cumulative %", overlaying="y", side="right",
-                    range=[0, 105], showgrid=False,
-                    tickfont=dict(color=CHART_TEXT)),
-        legend=dict(orientation="h", y=1.12, x=0,
-                    font=dict(size=10, color=CHART_TEXT)),
-        plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
-        hovermode="x unified",
-    )
-    st.plotly_chart(figure, width="stretch",
-                    config={"displayModeBar": False})
-
-
-def chart_severity_donut(products: pd.DataFrame) -> None:
-    """Donut of the alert-severity mix: how the SKUs are split by urgency."""
-    severity = (
-        products.groupby("alert_severity", as_index=False)
-        .agg(sku_count=("product_id", "count"),
-             revenue=("revenue", "sum"))
-        .sort_values("sku_count", ascending=False)
-    )
-    figure = go.Figure(go.Pie(
-        labels=severity["alert_severity"], values=severity["sku_count"],
-        hole=0.5, sort=False,
-        marker=dict(colors=[SEVERITY_COLORS.get(s, "#8395a7")
-                            for s in severity["alert_severity"]],
-                    line=dict(color="#ffffff", width=2)),
-        textinfo="label+value", textfont=dict(size=11, color=CHART_TEXT),
-        hovertemplate="<b>%{label}</b><br>SKUs: %{value}<extra></extra>",
-    ))
-    figure.update_layout(
-        height=400, margin=dict(t=10, b=10), showlegend=False,
-        font=dict(color=CHART_TEXT),
-        paper_bgcolor="rgba(0,0,0,0)",
-    )
-    st.plotly_chart(figure, width="stretch",
-                    config={"displayModeBar": False})
+        name="Inventory value at cost", x=ordered["category"],
+        y=ordered["inventory_value"], marker=dict(color="#c9d6e0",
+                                                   line=dict(width=0)),
+        hovertemplate="<b>%{x}</b><br>Inventory $%{y:,.0f}<extra></extra>")
+    figure.add_bar(
+        name="Revenue", x=ordered["category"], y=ordered["revenue"],
+        marker=dict(color=ACCENT, line=dict(width=0)),
+        hovertemplate="<b>%{x}</b><br>Revenue $%{y:,.0f}<extra></extra>")
+    figure.update_layout(**_base_layout(
+        330, barmode="group", showlegend=True,
+        legend=dict(orientation="h", y=1.16, x=0,
+                    font=dict(size=10.5, color=CHART_TEXT)),
+        xaxis=dict(tickfont=dict(color=CHART_TEXT, size=10.5), showgrid=False),
+        yaxis=dict(tickfont=dict(color=CHART_TEXT), gridcolor=CHART_GRID,
+                   tickprefix="$", separatethousands=True)))
+    st.plotly_chart(figure, width="stretch", config={"displayModeBar": False})
 
 
 # =============================================================================
-# SECTION 7 :: THE ACTION TABLE  (REQUIRED #2)
+# SECTION 7 :: TABLES
 # =============================================================================
 
-def render_restock_table(products: pd.DataFrame) -> None:
-    """'Immediate Restock Actions Required' - the operational deliverable.
+def render_action_queue(products: pd.DataFrame) -> None:
+    """The operational deliverable: what to do today, most expensive first.
 
-    st.dataframe is INTERACTIVE out of the box (column sorting, text search,
-    column resizing, CSV download) because Streamlit renders it with a
-    virtualised front-end grid.  column_config adds number formatting,
-    progress bars and semantic colouring without a single line of HTML.
+    Sorted by `net_exposure` rather than alphabetically, so the worst problem
+    is always row one. Interactive by construction (Streamlit's virtualised
+    grid gives sorting, search, resize and CSV download for free).
     """
-    action_queue = products[products["alert_severity"] != "OK"].copy()
-    if action_queue.empty:
-        st.success("No SKUs require immediate action for the selected filters. "
-                   "The warehouse is fully compliant.")
+    queue = products[products["alert_severity"] != "OK"].copy()
+    if queue.empty:
+        st.success("No SKU in this selection requires action. "
+                   "Every buffer is above its safety level.")
         return
+    queue = queue.sort_values("net_exposure", ascending=False)
 
-    action_queue = action_queue.sort_values(
-        ["alert_severity", "reorder_value"], ascending=[True, False]
-    )
-
-    display = action_queue[[
-        "product_id", "product_name", "category", "warehouse_zone",
-        "abc_class", "alert_severity", "alert_flags", "current_stock",
-        "safety_stock_level", "stock_buffer_ratio", "reorder_quantity",
-        "reorder_value", "days_of_supply", "inventory_turnover_ratio_annualized",
-        "revenue", "recommended_action",
-    ]].rename(columns={
-        "product_id": "SKU",
-        "product_name": "Product",
-        "category": "Category",
-        "warehouse_zone": "Zone",
-        "abc_class": "ABC",
-        "alert_severity": "Severity",
-        "alert_flags": "Alert",
-        "current_stock": "On Hand",
-        "safety_stock_level": "Safety Level",
-        "stock_buffer_ratio": "Buffer Ratio",
-        "reorder_quantity": "Reorder Qty",
-        "reorder_value": "Reorder Value ($)",
-        "days_of_supply": "Days of Supply",
-        "inventory_turnover_ratio_annualized": "ITR (annualised)",
-        "revenue": "Revenue ($)",
-        "recommended_action": "Recommended Action",
+    # Plain text, not HTML. st.dataframe renders through a sanitising grid, so
+    # an injected <span class="chip"> is stripped to bare text. Status is
+    # instead encoded as a leading glyph plus a text label, which survives
+    # sanitisation and stays legible when the table is exported to CSV.
+    glyph = {"Stockout Risk": "▲", "Dead Stock": "■"}
+    display = pd.DataFrame({
+        "SKU": queue["product_id"],
+        "Product": queue["product_name"],
+        "Category": queue["category"],
+        "Zone": queue["warehouse_zone"],
+        "ABC": queue["abc_class"],
+        "Condition": [u"{} {}".format(glyph.get(a, "●"), a)
+                      for a in queue["alert_flags"]],
+        "On hand": queue["current_stock"],
+        "Safety": queue["safety_stock_level"],
+        "Days supply": queue["days_of_supply"],
+        "Reorder qty": queue["reorder_quantity"],
+        "Reorder value": queue["reorder_value"],
+        "Demand missed": queue["unsellable_units"],
+        "Lost margin": queue["lost_margin_estimate"],
+        "Trapped capital": queue["trapped_capital"],
+        "Net exposure": queue["net_exposure"],
+        "Buffer risk": queue["safety_stock_risk"],
+        "Action": queue["recommended_action"],
     })
 
     st.dataframe(
-        display,
-        width="stretch",
-        hide_index=True,
-        height=min(420, 60 + 35 * len(display)),
+        display, width="stretch", hide_index=True,
+        height=min(430, 62 + 35 * len(display)),
         column_config={
-            "Severity": st.column_config.TextColumn(
-                "Severity", help="CRITICAL > HIGH > MEDIUM > OK"),
-            "ABC": st.column_config.TextColumn("ABC"),
-            "On Hand": st.column_config.NumberColumn("On Hand", format="%d"),
-            "Safety Level": st.column_config.NumberColumn("Safety Level", format="%d"),
-            "Buffer Ratio": st.column_config.ProgressColumn(
-                "Buffer Ratio", min_value=0.0, max_value=2.0, format="%.2f",
-                help="On-hand ÷ safety level. Below 1.0 means the buffer is "
-                     "already breached."),
-            "Reorder Qty": st.column_config.NumberColumn("Reorder Qty", format="%d"),
-            "Reorder Value ($)": st.column_config.NumberColumn(format="$%.2f"),
-            "Days of Supply": st.column_config.NumberColumn(format="%.1f"),
-            "ITR (annualised)": st.column_config.NumberColumn(format="%.2f"),
-            "Revenue ($)": st.column_config.NumberColumn(format="$%.2f"),
-        },
-    )
+            "ABC": st.column_config.TextColumn("ABC", width="small"),
+            "Condition": st.column_config.TextColumn("Condition", width="small"),
+            "Buffer risk": st.column_config.TextColumn("Buffer risk",
+                                                       width="small"),
+            "On hand": st.column_config.NumberColumn("On hand", format="%d"),
+            "Safety": st.column_config.NumberColumn("Safety", format="%d"),
+            "Days supply": st.column_config.NumberColumn("Days supply",
+                                                         format="%.1f"),
+            "Reorder qty": st.column_config.NumberColumn("Reorder qty",
+                                                         format="%d"),
+            "Reorder value": st.column_config.NumberColumn("Reorder value",
+                                                           format="$%.0f"),
+            "Demand missed": st.column_config.NumberColumn(
+                "Demand missed", format="%.1f",
+                help="Lower bound on unmet demand: units short of one "
+                     "safety-level of cover at the observed daily rate."),
+            "Lost margin": st.column_config.NumberColumn("Lost margin",
+                                                         format="$%.0f"),
+            "Trapped capital": st.column_config.NumberColumn("Trapped capital",
+                                                             format="$%.0f"),
+            "Net exposure": st.column_config.NumberColumn(
+                "Net exposure", format="$%.0f",
+                help="Lost margin + trapped capital. The single number that "
+                     "ranks the action queue."),
+            "Action": st.column_config.TextColumn("Recommended action",
+                                                  width="medium"),
+        })
+    st.markdown(
+        '<p class="dataframe-note">Ordered by net exposure. Click any column '
+        'header to re-sort, or use the download icon for CSV. Figures in the '
+        'Condition and Buffer risk columns are status chips.</p>',
+        unsafe_allow_html=True)
+
+
+def render_risk_register(products: pd.DataFrame) -> None:
+    """The parameter-review table: which SKUs have the wrong safety level.
+
+    Deliberately separates SKUs we can measure from those we cannot, because
+    the whole point is that a censored demand signal must not be mistaken for
+    a low-risk one.
+    """
+    register = products[products["daily_demand_mean"] > 0].copy()
+    if register.empty:
+        st.info("No SKU in this selection recorded any demand in the window.")
+        return
+    register = register.sort_values("safety_stock_gap", ascending=False, na_position="last")
+
+    signal_glyph = {"Observed": "●", "Censored": "▲", "No Demand": "—"}
+    display = pd.DataFrame({
+        "SKU": register["product_id"],
+        "Product": register["product_name"],
+        "Category": register["category"],
+        "Signal": [u"{} {}".format(signal_glyph.get(q, "●"), q)
+                   for q in register["demand_signal_quality"]],
+        "Mean/day": register["daily_demand_mean"],
+        "Std dev": register["daily_demand_sigma"],
+        "Peak/day": register["daily_demand_peak"],
+        "CV": register["demand_cv"],
+        "Configured": register["safety_stock_level"],
+        "Recommended": register["recommended_safety_stock"],
+        "Gap": register["safety_stock_gap"],
+        "Next 7d (low)": register["forecast_next_7d_low"],
+        "Next 7d (mid)": register["forecast_next_7d"],
+        "Next 7d (high)": register["forecast_next_7d_high"],
+        "Verdict": register["safety_stock_risk"],
+    })
+
+    st.dataframe(
+        display, width="stretch", hide_index=True,
+        height=min(430, 62 + 35 * len(display)),
+        column_config={
+            "Signal": st.column_config.TextColumn("Signal", width="small"),
+            "Verdict": st.column_config.TextColumn("Verdict", width="small"),
+            "Mean/day": st.column_config.NumberColumn("Mean/day", format="%.2f"),
+            "Std dev": st.column_config.NumberColumn("Std dev", format="%.2f"),
+            "Peak/day": st.column_config.NumberColumn("Peak/day", format="%d"),
+            "CV": st.column_config.NumberColumn(
+                "CV", format="%.2f",
+                help="Coefficient of variation: std dev / mean of daily "
+                     "demand. Above ~0.8 is hard to forecast."),
+            "Configured": st.column_config.NumberColumn("Configured",
+                                                        format="%.0f"),
+            "Recommended": st.column_config.NumberColumn(
+                "Recommended", format="%.0f",
+                help="z * sigma * sqrt(lead time) for a 95% service level "
+                     "over a 21-day lead time."),
+            "Gap": st.column_config.NumberColumn("Gap", format="%.0f"),
+            "Next 7d (low)": st.column_config.NumberColumn("Next 7d (low)",
+                                                           format="%.1f"),
+            "Next 7d (mid)": st.column_config.NumberColumn("Next 7d (mid)",
+                                                           format="%.1f"),
+            "Next 7d (high)": st.column_config.NumberColumn("Next 7d (high)",
+                                                            format="%.1f"),
+        })
+    st.markdown(
+        '<p class="dataframe-note">Gap = recommended − configured. Blank means '
+        'the demand signal is censored (see the note above), not zero.</p>',
+        unsafe_allow_html=True)
 
 
 def render_full_inventory(products: pd.DataFrame) -> None:
-    """The complete 60-row analytical frame, for auditors and examiners."""
+    """The complete analytical frame, for auditors and examiners."""
     st.dataframe(
-        products.drop(columns=[c for c in ("is_dead_stock", "is_stockout_risk",
-                                           "opening_stock_est", "txn_count",
-                                           "cost")]),
-        width="stretch", hide_index=True, height=380,
+        products.drop(columns=[c for c in (
+            "is_dead_stock", "is_stockout_risk", "opening_stock_est",
+            "txn_count", "cost", "safety_stock_cover_days",
+            "daily_demand_peak", "active_sales_days", "service_level_z",
+            "assumed_lead_time_days", "lost_revenue_estimate",
+            "demand_cover_shortfall", "unsellable_units")]),
+        width="stretch", hide_index=True, height=400,
         column_config={
             "revenue": st.column_config.NumberColumn("revenue", format="$%.2f"),
             "cogs": st.column_config.NumberColumn("cogs", format="$%.2f"),
             "margin": st.column_config.NumberColumn("margin", format="$%.2f"),
-            "margin_pct": st.column_config.NumberColumn("margin_pct", format="%.2f%%"),
+            "margin_pct": st.column_config.NumberColumn("margin_pct",
+                                                        format="%.2f%%"),
             "price": st.column_config.NumberColumn("price", format="$%.2f"),
-            "inventory_value": st.column_config.NumberColumn(
-                "inventory_value", format="$%.2f"),
+            "inventory_value": st.column_config.NumberColumn("inventory_value",
+                                                             format="$%.2f"),
             "average_inventory_value": st.column_config.NumberColumn(
                 "average_inventory_value", format="$%.2f"),
             "revenue_share_pct": st.column_config.NumberColumn(
                 "revenue_share_pct", format="%.3f%%"),
             "cumulative_revenue_pct": st.column_config.NumberColumn(
                 "cumulative_revenue_pct", format="%.3f%%"),
-        },
-    )
+            "net_exposure": st.column_config.NumberColumn("net_exposure",
+                                                          format="$%.2f"),
+        })
 
 
 # =============================================================================
-# SECTION 8 :: ARCHITECTURE / VIVA PANEL
+# SECTION 8 :: PROVENANCE / VIVA PANEL
 # =============================================================================
 
-def render_architecture_panel(meta: Dict[str, object], manifest: Dict[str, object],
-                              actions: List[dict]) -> None:
-    """Documentation panel: what ran, on what, and what the Spark concepts were."""
-    tab1, tab2, tab3, tab4 = st.tabs(
-        ["🏗️ Architecture", "⚙️ Spark actions", "🗄️ HDFS manifest", "🎓 Viva notes"]
-    )
+def render_provenance(meta: Dict[str, object], manifest: Dict[str, object]) -> None:
+    t1, t2, t3, t4 = st.tabs(["Pipeline", "Spark actions", "HDFS layout",
+                               "Viva notes"])
 
-    with tab1:
+    with t1:
         st.markdown("""
-**Data flow**
-
 | Stage | Engine | What happens |
 |---|---|---|
-| 1. Ingestion | Python / Pandas | 3 CSV partitions written to a simulated HDFS namespace with Hadoop `_SUCCESS` commit markers |
-| 2. Read | **PySpark** | `spark.read.schema(...).csv(...)` – schema-on-read, `FAILFAST` mode, explicit `timestampFormat` |
-| 3. Aggregate | **PySpark** | `groupBy(product_id)` → units, revenue, COGS (one shuffle, cached because it feeds 3 consumers) |
-| 4. ABC class | **PySpark** | `Window.orderBy(revenue desc).rowsBetween(unboundedPreceding, -1)` → cumulative % → 80/15/5 cut |
-| 5. Turnover | **PySpark** | COGS ÷ average inventory value, plus days-of-supply |
-| 6. Alerts | **PySpark** | `LEFT ANTI JOIN` for dead stock, `<=` for stockout risk |
-| 7. Unify | **PySpark** | product master as the LEFT spine, three broadcast joins |
-| 8. Action | **PySpark → Pandas** | `toPandas()` (Arrow) — the *only* place data leaves the JVM |
-| 9. Present | Streamlit | filter a 60-row frame, KPI cards, Plotly charts |
+| 1. Ingest | Python | Three CSV partitions written to a simulated HDFS namespace, each committed with a Hadoop `_SUCCESS` marker |
+| 2. Read | **PySpark** | `spark.read.schema(...).csv(...)` — schema-on-read, `FAILFAST`, explicit `timestampFormat` |
+| 3. Aggregate | **PySpark** | `groupBy(product_id)` → units, revenue, COGS. Cached: three downstream consumers |
+| 4. Spine | **PySpark** | Product master as the LEFT side, so dead stock is never lost |
+| 5. ABC | **PySpark** | `Window.orderBy(revenue desc).rowsBetween(unboundedPreceding, -1)` → 80/15/5 cut |
+| 6. Turnover | **PySpark** | COGS ÷ average inventory value, plus days of supply |
+| 7. Alerts | **PySpark** | Stockout (`<=`) and dead stock (`LEFT ANTI JOIN`) |
+| 8. Risk | **PySpark** | Daily-demand re-aggregation → CV, service-level buffer, 7-day forecast band |
+| 9. Impact | **PySpark** | Lost margin and trapped capital per SKU |
+| 10. Action | **PySpark → Pandas** | `toPandas()` — the only place data leaves the JVM |
+| 11. Present | Streamlit | Filter 60 rows, KPI tiles, charts, action queue |
 
-**Why the product master is the spine**
-An inner join would silently drop the five dead-stock SKUs — the exact rows the
-dashboard exists to alert on. Dimension tables drive report shape; facts never do.
+**Two design decisions worth defending**
+- The **product master is the LEFT spine** of every join. An inner join would
+  silently drop the five dead-stock SKUs — the exact rows this console exists
+  to surface.
+- **`.cache()` on the sales aggregation** because that node feeds three
+  consumers; without it Spark re-scans and re-shuffles the ledger three times.
 """)
 
-    with tab2:
-        st.markdown("**Every ACTION executed by the pipeline** "
-                    "(`toPandas`/`first` are the only calls that trigger real Spark jobs):")
-        st.dataframe(pd.DataFrame(actions), width="stretch",
+    with t2:
+        st.markdown("**Every action the pipeline executed.** Only these calls "
+                    "trigger real Spark jobs; everything above them is lazy.")
+        st.dataframe(pd.DataFrame(meta.get("actions", [])), width="stretch",
                      hide_index=True)
-        st.caption("Lazy evaluation: the ~40 transformations above the first "
-                   "action built a DAG without touching a single byte of data.")
+        total = sum(a["seconds"] for a in meta.get("actions", []) or [])
+        st.caption("{} actions totalling {:.2f}s of distributed work.".format(
+            len(meta.get("actions", []) or []), total))
 
-    with tab3:
+    with t3:
         if manifest:
             st.json(manifest, expanded=False)
         else:
-            st.info("No manifest found (the dataset was generated in an earlier run).")
+            st.info("No manifest found (the dataset was built in an earlier run).")
         st.caption("Local mock root: `{}`".format(HDFS_LOCAL_ROOT))
 
-    with tab4:
+    with t4:
         st.markdown("""
-**The five questions to be ready for**
+**Q. Why Spark for 2,500 rows?**
+The architecture is identical at 2.5 billion rows — the same DAG, shuffles and
+Catalyst optimisations. Scaling the data does not change the code; that is the
+point of the DataFrame API.
 
-1. **Why is Spark used at all here?** The 2,500-row ledger is small, but the
-   architecture is identical at 2.5 billion rows: the same DAG, the same
-   shuffles, the same Catalyst optimisations. The code does not change when
-   the data volume does — that is the whole point of the DataFrame API.
-2. **Lazy evaluation?** `filter/join/groupBy` only append nodes to the lineage
-   graph. Nothing executes until an action (`toPandas`, `count`, `show`,
-   `write`). Proof: the console prints every action with its duration.
-3. **Broadcast vs shuffle?** `F.broadcast()` on the two 60-row tables avoids
-   shuffling them. The one unavoidable shuffle is the `groupBy`.
-4. **How do you find dead stock?** `LEFT ANTI JOIN` — a single hash anti-join,
-   versus the `COUNT(*) = 0` anti-pattern which forces two extra aggregations.
-5. **What is ABC analysis and where is the 80% line?** A windowed running
-   total of revenue, cut at 80% and 95%. The SKU that *pushes* the cumulative
-   total across a threshold stays in the higher class — we use an **exclusive**
-   frame (`rowsBetween(unboundedPreceding, -1)`) to get the "before" value.
+**Q. Lazy evaluation?**
+`filter / join / groupBy` only append to the lineage DAG. Nothing executes
+until an action (`toPandas`, `count`, `show`, `first`, `write`). The *Spark
+actions* tab lists all of them with their measured durations.
 
-**Two design decisions worth highlighting**
-- The **product master is the LEFT spine** of every join. An inner join would
-  silently drop the five dead-stock SKUs — the exact rows this dashboard
-  exists to alert on.
-- **`.cache()` on the sales aggregation**, because that node feeds three
-  downstream consumers. Without it Spark re-scans and re-shuffles the ledger
-  three times.
+**Q. Broadcast versus shuffle?**
+`F.broadcast()` on the 60-row dimensions avoids shuffling them. Every join in
+the physical plan is a `BroadcastHashJoin`; the only unavoidable shuffle is the
+`groupBy` and the daily-demand re-aggregation.
+
+**Q. How is dead stock found?**
+`LEFT ANTI JOIN` — one hash anti-join. The `COUNT(*) = 0` alternative forces
+two extra aggregations and cannot be combined with other columns.
+
+**Q. Where is the 80% cut?**
+A windowed running total of revenue, classified on the share *before* each SKU
+so the SKU that crosses 80% stays in class A. That requires the exclusive frame
+`rowsBetween(Window.unboundedPreceding, -1)`.
+
+**Q. What does `sqrt(lead time)` do in the safety-stock formula?**
+Daily demand noise is independent, so variance accumulates linearly with the
+lead time while standard deviation grows only as the square root. Under-ordering
+this term is the textbook cause of chronic stockouts.
+
+**Q. Why is the gap blank for the stockout SKUs?**
+Because their demand is *censored*: an out-of-stock SKU records no transactions,
+so its observed mean is biased low and any recommendation derived from it is
+unreliable. We label those SKUs `Censored` and return `NULL` rather than
+publishing a precise-looking number we know is wrong. Correcting the bias
+properly needs substitution or EM estimation against out-of-stock-period data,
+which we do not have.
 """)
-        if meta.get("actions"):
-            total_actions = len(meta["actions"])
-            total_secs = sum(a["seconds"] for a in meta["actions"])
-            st.info("Pipeline executed **{} Spark actions** totalling "
-                    "**{:.2f}s** of cluster work.".format(total_actions, total_secs))
 
 
 # =============================================================================
-# SECTION 9 :: MAIN  (Streamlit executes top-to-bottom on every interaction)
+# SECTION 9 :: MAIN
 # =============================================================================
 
 def main() -> None:
     manifest = read_manifest()
 
-    # ---- 1. LOAD (or bootstrap the HDFS layer, then run Spark) -----------
+    # ---- 1. LOAD (auto-bootstrap HDFS, then run Spark) --------------------
     try:
         results = load_pipeline()
     except Exception as exc:                       # pragma: no cover
@@ -939,113 +1031,178 @@ def main() -> None:
         st.exception(exc)
         st.stop()
 
-    products_all: pd.DataFrame = results["products"]
+    all_products: pd.DataFrame = results["products"]
     meta: Dict[str, object] = results["meta"]
     kpis: Dict[str, object] = results["kpis"]
-
-    # ---- 2. HERO HEADER --------------------------------------------------
     ingestion = meta.get("ingestion", {}) or {}
+
+    # ---- 2. APP BAR -------------------------------------------------------
     st.markdown("""
-    <div class="smartstock-hero">
-      <h1>📦 SmartStock: HDFS &amp; PySpark Enterprise Analytics</h1>
-      <p>60 SKUs · 2,500 ledger transactions · 5 warehouse zones —
-         a <b>Simulated HDFS RAW layer</b> is parsed with explicit
-         <b>StructType</b> schemas and analysed by a <b>PySpark</b> pipeline
-         (lazy DAG → window functions → broadcast joins) before being safely
-         converted to Pandas for this Streamlit console.</p>
-      <div class="hero-pills">
-        <span class="hero-pill">🗄️ HDFS RAW layer</span>
-        <span class="hero-pill">⚡ PySpark {}</span>
-        <span class="hero-pill">📊 {} transactions</span>
-        <span class="hero-pill">🗓️ {} day window</span>
-        <span class="hero-pill">🐍 Python {}</span>
+    <div class="appbar">
+      <div class="brand"><span class="mark">▦</span> SmartStock Inventory Control Tower</div>
+      <div class="meta">
+        <span>Engine <b>PySpark {}</b></span>
+        <span>Catalog <b>{} SKUs</b></span>
+        <span>Events <b>{}</b></span>
+        <span>Window <b>{}d</b></span>
+        <span>Pipeline <b>{}s</b></span>
       </div>
     </div>
     """.format(
-        meta.get("spark_version"), fmt_number(ingestion.get("sales_ledger_rows")),
-        meta.get("sales_window_days"), "{}.{}.{}".format(*sys.version_info[:3]),
-    ), unsafe_allow_html=True)
+        meta.get("spark_version"), len(all_products),
+        num(ingestion.get("sales_ledger_rows")),
+        meta.get("sales_window_days"), meta.get("total_seconds")),
+        unsafe_allow_html=True)
 
-    # ---- 3. SIDEBAR FILTERS + SLICE --------------------------------------
-    filters = render_sidebar(products_all, meta)
-    products = apply_filters(products_all, filters)
-    slice_is_empty = products.empty
-
-    # Chart-ready rollups.  When nothing is filtered we use the aggregates
-    # Spark already computed (the "no extra work" fast path); once the user
-    # slices, we recompute the tiny rollups in Pandas for instant feedback.
+    # ---- 3. FILTERS + SLICE ----------------------------------------------
+    filters = render_sidebar(all_products, meta)
+    products = apply_filters(all_products, filters)
+    empty = products.empty
     filters_active = any([
         filters["categories"], filters["classes"], filters["zones"],
-        filters["severities"], filters["min_revenue"], filters["only_alerts"],
-    ])
-    if filters_active and not slice_is_empty:
-        categories, abc, totals = rollup_slice(products)
-    elif slice_is_empty:
+        filters["severities"], filters["min_revenue"], filters["only_alerts"]])
+
+    if empty:
+        st.warning("No SKU matches the current filters. Widen the selection, "
+                    "or press **Reset all filters** in the sidebar.")
         categories = pd.DataFrame(columns=["category", "revenue", "sku_count"])
         abc = pd.DataFrame(columns=["abc_class", "abc_class_label", "sku_count"])
-        totals = {"revenue": 0.0, "cogs": 0.0, "inventory_value": 0.0,
-                  "average_inventory_value": 0.0, "stockout": 0, "dead": 0}
+        totals = {k: 0.0 for k in (
+            "revenue", "cogs", "margin", "inventory_value", "avg_inventory_value",
+            "net_exposure", "lost_margin", "lost_revenue", "trapped",
+            "reorder_value", "avg_cv")}
+        totals.update({"stockout": 0, "dead": 0, "under_buffered": 0,
+                       "over_buffered": 0, "censored": 0})
     else:
-        categories, abc, totals = results["categories"], results["abc_summary"], {
-            "revenue": float(kpis["total_revenue"]),
-            "cogs": float(kpis["total_cogs"]),
-            "inventory_value": float(kpis["total_inventory_value"]),
-            "average_inventory_value": float(kpis["total_average_inventory_value"]),
-            "stockout": int(kpis["stockout_risk_items"]),
-            "dead": int(kpis["dead_stock_items"]),
-        }
+        categories, abc, totals = rollup(products)
 
-    if slice_is_empty:
-        st.warning("No SKUs match the current filters. Widen the selection in "
-                    "the sidebar (or press *Reset all filters*).")
-
-    # ---- 4. KPI ROW -------------------------------------------------------
-    render_kpi_row(totals, kpis, len(products), len(products_all), filters_active)
-
-    if not slice_is_empty:
-        # ---- 5. VISUAL ANALYTICS ------------------------------------------
-        section_head("📊", "Revenue by Product Category",
-                     "Horizontal bar chart — every dollar generated per "
-                     "category over the analysis window.")
-        chart_revenue_by_category(categories)
-
-        left, right = st.columns(2, gap="medium")
-        with left:
-            section_head("🧭", "ABC Inventory Distribution",
-                         "Share of SKUs in each value class (80 / 15 / 5 rule).")
-            chart_abc_distribution(abc)
-        with right:
-            section_head("🚨", "Alert Severity Mix",
-                         "How the current selection splits by urgency.")
-            chart_severity_donut(products)
-
-        section_head("📈", "Pareto Curve — Revenue Concentration",
-                     "The Spark window function made visual: the dashed lines "
-                     "mark the 80% and 95% ABC cut-offs.")
-        chart_pareto_curve(products)
-
-        # ---- 6. ACTION TABLE ----------------------------------------------
-        section_head("🛠️", "Immediate Restock Actions Required",
-                     "Prioritised by severity, then by capital at risk. "
-                     "Click a column header to sort, or download as CSV.")
-        render_restock_table(products)
-
-        # ---- 7. FULL INVENTORY (collapsible) ------------------------------
-        with st.expander("📋 Full analytical inventory frame (all {} SKUs in "
-                         "scope)".format(len(products)), expanded=False):
-            render_full_inventory(products)
-
-    # ---- 8. ARCHITECTURE / VIVA PANEL ------------------------------------
-    st.markdown("---")
-    render_architecture_panel(meta, manifest, meta.get("actions", []))
+    # ---- 4. HEADLINE EXPOSURE --------------------------------------------
+    scope = "filtered selection" if filters_active else "whole catalogue"
+    exposure_pct = (totals["net_exposure"] / totals["revenue"] * 100
+                    if totals["revenue"] else 0.0)
+    if totals["censored"]:
+        buffer_tone = "critical"
+    elif totals["under_buffered"]:
+        buffer_tone = "warning"
+    else:
+        buffer_tone = "ok"
 
     st.markdown(
-        '<div class="footer">SmartStock: HDFS &amp; PySpark Inventory Analytics '
-        'Suite · built with Streamlit {} · Plotly · PySpark {} · '
-        'simulated HDFS namespace at <code>{}</code></div>'.format(
-            st.__version__, meta.get("spark_version"), HDFS_LOCAL_ROOT),
+        '<div class="sec"><span class="num">01</span>'
+        '<h3>Capital at risk</h3></div>'
+        '<div class="hint">Cost of the open alerts across the {}. '
+        'These are estimates from observed demand, not forecasts.</div>'
+        .format(scope),
         unsafe_allow_html=True,
     )
+    c = st.columns(5, gap="small")
+    with c[0]:
+        tile("Net exposure",
+             compact_money(totals["net_exposure"]),
+             "{}% of revenue".format(num(exposure_pct, 1)),
+             "Lost margin {} + trapped {}".format(
+                 compact_money(totals["lost_margin"]),
+                 compact_money(totals["trapped"])),
+             tone="critical" if totals["net_exposure"] > 0 else "ok")
+    with c[1]:
+        tile("Revenue in scope", compact_money(totals["revenue"]),
+             "{:.1f}% margin".format(
+                 (totals["margin"] / totals["revenue"] * 100)
+                 if totals["revenue"] else 0.0),
+             "COGS {} · {} SKUs".format(
+                 compact_money(totals["cogs"]), len(products)),
+             tone="info")
+    with c[2]:
+        tile("Stockout risk", num(totals["stockout"]),
+             "on hand ≤ safety level" if totals["stockout"] else "all buffers held",
+             "Replenishment {}".format(compact_money(totals["reorder_value"])),
+             tone="critical" if totals["stockout"] else "ok")
+    with c[3]:
+        tile("Dead stock", num(totals["dead"]),
+             "no demand in window" if totals["dead"] else "none found",
+             "Capital frozen on shelf",
+             tone="warning" if totals["dead"] else "ok")
+    with c[4]:
+        tile("Buffer misalignment", num(totals["under_buffered"]),
+             "{} censored · {} over".format(totals["censored"],
+                                            totals["over_buffered"]),
+             "vs 95% service level, 21d lead",
+             tone=buffer_tone)
+
+    if not empty:
+        # ---- 5. ACTION QUEUE ----------------------------------------------
+        st.markdown(
+            '<div class="sec"><span class="num">02</span>'
+            '<h3>Action queue</h3></div>'
+            '<div class="hint">Ranked by net exposure, so the most expensive '
+            'problem is the first row. Every figure is traceable to a Spark '
+            'action listed under Pipeline below.</div>',
+            unsafe_allow_html=True)
+        render_action_queue(products)
+
+        # ---- 6. WHERE THE MONEY IS ----------------------------------------
+        st.markdown(
+            '<div class="sec"><span class="num">03</span>'
+            '<h3>Composition of the exposure</h3></div>'
+            '<div class="hint">Lost margin and trapped capital need opposite '
+            'decisions — buy more versus liquidate — so they are shown as '
+            'separate series.</div>',
+            unsafe_allow_html=True)
+        left, right = st.columns(2, gap="medium")
+        with left:
+            chart_exposure_by_sku(products)
+        with right:
+            chart_revenue_by_category(categories)
+
+        st.markdown(
+            '<div class="sec"><span class="num">04</span>'
+            '<h3>Portfolio structure</h3></div>'
+            '<div class="hint">Where capital is held versus generated, and how '
+            'the catalogue splits by value class.</div>',
+            unsafe_allow_html=True)
+        left, right = st.columns(2, gap="medium")
+        with left:
+            chart_turnover_by_category(categories)
+        with right:
+            chart_abc_distribution(abc)
+
+        # ---- 7. DEMAND RISK ------------------------------------------------
+        st.markdown(
+            '<div class="sec"><span class="num">05</span>'
+            '<h3>Demand risk &amp; safety-stock parameters</h3></div>'
+            '<div class="hint">The safety levels currently configured in the '
+            'warehouse are static, but demand is not. These charts compare the '
+            'configured buffer against a service-level requirement derived '
+            'from each SKU&#39;s own demand volatility.</div>',
+            unsafe_allow_html=True)
+        left, right = st.columns(2, gap="medium")
+        with left:
+            chart_buffer_gap(products)
+        with right:
+            chart_volatility_vs_revenue(products)
+
+        st.markdown(
+            '<div class="sec"><span class="num">06</span>'
+            '<h3>Safety-stock parameter review</h3></div>'
+            '<div class="hint">One row per SKU with usable demand data, sorted '
+            'by the size of the gap. Blank gaps are demand-censored, not zero.</div>',
+            unsafe_allow_html=True)
+        render_risk_register(products)
+
+        with st.expander("Full analytical frame — {} SKUs × {} columns"
+                         .format(len(products), len(products.columns))):
+            render_full_inventory(products)
+
+    # ---- 8. PROVENANCE ----------------------------------------------------
+    st.markdown("---")
+    render_provenance(meta, manifest)
+
+    st.markdown(
+        '<div class="foot-note">SmartStock Inventory Control Tower &middot; '
+        'Streamlit {} &middot; Plotly &middot; PySpark {} &middot; simulated '
+        'HDFS at <code>{}</code></div>'.format(
+            st.__version__, meta.get("spark_version"), HDFS_LOCAL_ROOT),
+        unsafe_allow_html=True)
 
 
 if __name__ == "__main__":
