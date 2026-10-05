@@ -64,3 +64,13 @@ hadoop*-out/
 .DS_Store
 Thumbs.db
 *.log
+
+# Scratch output from `--export`, batch runs and manual inspection.
+# These are regenerable at any time with:
+#   python pyspark_analytics_engine.py --export out.csv
+_t.csv
+check.csv
+r.csv
+v.csv
+out.csv
+inventory_analytics.csv
