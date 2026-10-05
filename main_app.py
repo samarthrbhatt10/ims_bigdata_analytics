@@ -157,24 +157,29 @@ CSS = """
 [data-testid="stTabs"] [aria-selected="true"] { color: #0f2a3f; }
 [data-testid="stTabs"] [data-baseweb="tab-highlight"],
 [data-testid="stTabs"] [data-baseweb="tab-border"] { background-color: #1d5f8a; }
-.block-container { padding-top: 1.1rem; padding-bottom: 2.4rem; max-width: 1560px; }
+.block-container { padding-top: 0; padding-bottom: 2.4rem; max-width: 1560px; }
 
 /* ---- App bar ------------------------------------------------------------ */
+/* margin-top clears Streamlit's own fixed header (the toolbar with the Deploy
+   button), which otherwise overlaps the first line of the bar. */
 .appbar {
     background: #0f2a3f; color: #ffffff; padding: .7rem 1.1rem;
-    border-radius: 8px; margin-bottom: .85rem;
+    border-radius: 8px; margin: 2.9rem 0 .85rem;
     display: flex; align-items: center; justify-content: space-between;
     gap: 1rem; flex-wrap: wrap;
 }
 .appbar .brand { font-size: 1.02rem; font-weight: 700; letter-spacing: -.2px;
-                 display: flex; align-items: center; gap: .5rem; }
+                 display: flex; align-items: center; gap: .5rem;
+                 white-space: nowrap; }
 .appbar .brand .mark {
     display: inline-flex; align-items: center; justify-content: center;
     width: 26px; height: 26px; border-radius: 6px; background: #1d5f8a;
-    font-size: .82rem; font-weight: 800;
+    font-size: .82rem; font-weight: 800; flex: 0 0 auto;
 }
+/* nowrap keeps the bar to a single row, so its height -- and therefore the
+   alignment of everything below it -- does not change between renders. */
 .appbar .meta { font-size: .74rem; color: #cfe0ec; display: flex; gap: 1.1rem;
-                flex-wrap: wrap; }
+                flex-wrap: nowrap; white-space: nowrap; }
 .appbar .meta b { color: #ffffff; font-weight: 600; }
 
 /* ---- Section headers ---------------------------------------------------- */
@@ -193,12 +198,19 @@ CSS = """
 .tile { background: #ffffff; border: 1px solid #d8e0e8; border-radius: 8px;
         padding: .78rem .9rem .72rem; height: 100%;
         border-top: 3px solid var(--tone, #1d5f8a); }
-.tile .lbl { font-size: .63rem; font-weight: 700; letter-spacing: .07em;
-             text-transform: uppercase; color: #4a5c6a; line-height: 1.3;
-             min-height: 2.7em; }
-.tile .val { font-size: 1.5rem; font-weight: 700; color: #0f2a3f;
-             margin: .22rem 0 .1rem; line-height: 1.05; letter-spacing: -.5px;
-             font-variant-numeric: tabular-nums; white-space: nowrap; }
+/* word-break:keep-all is what stops "EXPOSURE" being split as "EXPOSUR E" in
+   a narrow column. hyphenation is off for the same reason. The reserved height
+   keeps all five values on one baseline regardless of label length. */
+.tile .lbl { font-size: .62rem; font-weight: 700; letter-spacing: .05em;
+             text-transform: uppercase; color: #4a5c6a; line-height: 1.32;
+             min-height: 3.3em; word-break: keep-all; hyphens: none;
+             overflow-wrap: normal; }
+/* clamp() lets the figure shrink on a narrow screen instead of clipping:
+   a truncated "$235.1K" is worse than a slightly smaller one. */
+.tile .val { font-size: clamp(1.15rem, 1.9vw, 1.5rem); font-weight: 700;
+             color: #0f2a3f; margin: .22rem 0 .1rem; line-height: 1.05;
+             letter-spacing: -.4px; font-variant-numeric: tabular-nums;
+             white-space: nowrap; }
 .tile .sub { font-size: .69rem; font-weight: 600; line-height: 1.4;
              font-variant-numeric: tabular-nums; }
 /* #4a5c6a (7.4:1) rather than the old #6b7f8f, which measured 4.15:1 here. */
@@ -237,10 +249,36 @@ CSS = """
 [data-testid="stSidebar"] [data-baseweb="select"] > div {
     background: rgba(255,255,255,.08) !important;
     border-color: rgba(255,255,255,.24) !important; }
+/* The placeholder ("All categories") is the only text on screen before the
+   user interacts, so it must be legible against navy. Streamlit renders it as
+   a plain DIV carrying the light theme's near-black text plus its own 0.6
+   alpha -- hence both the colour AND the opacity override, on every
+   descendant rather than just on `input`. */
+[data-testid="stSidebar"] [data-baseweb="select"] div,
+[data-testid="stSidebar"] [data-baseweb="select"] span,
+[data-testid="stSidebar"] [data-baseweb="select"] input,
+[data-testid="stSidebar"] [data-baseweb="select"] input::placeholder {
+    color: #cfe0ec !important; opacity: 1 !important; }
+/* The dropdown arrow is an SVG mask, so it needs re-colouring too. */
+[data-testid="stSidebar"] [data-baseweb="select"] svg {
+    fill: #cfe0ec !important; }
 [data-testid="stSidebar"] [data-baseweb="tag"] {
     background: rgba(255,255,255,.20) !important; color: #ffffff !important; }
 [data-testid="stSidebar"] [data-baseweb="tag"] svg { fill: #ffffff !important; }
-[data-testid="stSidebar"] [data-testid="stToggle"] label p { color: #e6eef4 !important; }
+/* st.toggle in this build renders its label outside the usual label element,
+   so target the toggle block itself rather than only its inner paragraph. */
+[data-testid="stSidebar"] [data-testid="stToggle"],
+[data-testid="stSidebar"] [data-testid="stToggle"] p,
+[data-testid="stSidebar"] [data-testid="stToggle"] span,
+[data-testid="stSidebar"] [data-testid="stToggle"] label {
+    color: #e6eef4 !important; }
+/* Slider: Streamlit's default thumb/track are tuned for a light sidebar and
+   were close to invisible on navy. */
+[data-testid="stSidebar"] [data-baseweb="slider"] div[role="slider"] {
+    background: #7fb8dc !important; box-shadow: 0 0 0 2px #0f2a3f !important; }
+[data-testid="stSidebar"] [data-testid="stSlider"] [data-testid="stTickBarMin"],
+[data-testid="stSidebar"] [data-testid="stSlider"] [data-testid="stTickBarMax"] {
+    color: #9dbdd4 !important; }
 .side-title { font-size: 1.05rem; font-weight: 700; color: #ffffff;
               letter-spacing: -.2px; }
 .side-sub { font-size: .7rem; color: #9dbdd4; margin-top: .1rem; }
@@ -1042,10 +1080,10 @@ def main() -> None:
       <div class="brand"><span class="mark">▦</span> SmartStock Inventory Control Tower</div>
       <div class="meta">
         <span>Engine <b>PySpark {}</b></span>
-        <span>Catalog <b>{} SKUs</b></span>
+        <span>SKUs <b>{}</b></span>
         <span>Events <b>{}</b></span>
         <span>Window <b>{}d</b></span>
-        <span>Pipeline <b>{}s</b></span>
+        <span>Run <b>{}s</b></span>
       </div>
     </div>
     """.format(

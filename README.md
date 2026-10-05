@@ -210,15 +210,22 @@ structure, and **colour is reserved for status** — so a red value always means
 | KPI labels, tile footers, section hints | 6.5–7.3:1 (AA) |
 | All 98 chart text nodes (axes, ticks, legends, titles) | ≥ 4.5:1 (AA) |
 
-Two non-obvious details worth knowing if you edit the stylesheet:
+Four non-obvious details worth knowing if you edit the stylesheet — all four
+were found by measuring the rendered DOM, not by reading the code:
 
 - **Plotly axis titles do not inherit the layout font.** They fall back to a
-  mid-grey measuring 3.7:1, so every `title=` in a chart is passed as
-  `dict(text=..., font=dict(color=...))` explicitly.
-- **`st.dataframe` sanitises HTML**, so injected `<span class="chip">` markup
-  is stripped to plain text. Table status uses a leading glyph (`▲` stockout,
-  `■` dead stock) which survives sanitisation and still reads correctly in an
-  exported CSV.
+  mid-grey measuring 3.7:1, so every `title=` is passed as
+  `dict(text=..., font=dict(color=...))`.
+- **`st.dataframe` sanitises HTML**, so injected `<span class="chip">` markup is
+  stripped to plain text. Table status uses a leading glyph (`▲` stockout, `■`
+  dead stock) which survives sanitisation and still reads in an exported CSV.
+- **The sidebar is navy, so every control needs overriding, not just text.**
+  Streamlit paints widget labels with the *light* theme's near-black, which put
+  the filter placeholders at 1.4:1 on navy. The multiselect placeholder also
+  carries its own 0.6 alpha, so both `color` and `opacity` must be forced.
+- **Narrow columns break words mid-syllable** unless `word-break: keep-all` and
+  `hyphens: none` are set — otherwise "EXPOSURE" renders as "EXPOSUR E". The
+  headline figure uses `clamp()` so it shrinks rather than clipping.
 
 **Why `.streamlit/config.toml` exists.** Streamlit follows your operating
 system's dark-mode setting. In dark mode it renders body text near-white
