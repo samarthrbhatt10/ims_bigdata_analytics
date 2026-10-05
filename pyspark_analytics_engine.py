@@ -1,106 +1,87 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-================================================================================
+===============================================================================
 SMARTSTOCK :: DISTRIBUTED ANALYTICS ENGINE   (pyspark_analytics_engine.py)
-================================================================================
-
-PURPOSE
--------
-The Big Data core of SmartStock.  This module owns the *entire* analytical
-pipeline and exposes ONE class, `PySparkInventoryEngine`, which returns a
-dictionary of ready-to-render Pandas DataFrames to the Streamlit UI.
-
-It is deliberately written as a CLASS (not a script) so that:
-  * the SparkSession lifecycle is encapsulated (create -> use -> stop),
-  * the same object can be cached by Streamlit's `st.cache_resource` so the
-    expensive JVM is started once, not on every widget interaction,
-  * it can be unit-tested / imported from a notebook without side effects.
-
-===============================================================================
-  THE FOUR SPARK CONCEPTS WE EXPLICITLY DEMONSTRATE  (memorise these)
 ===============================================================================
 
-1) LAZY EVALUATION
-   Spark does NOT execute anything when you call a DataFrame method.  Every
-   `filter / join / groupBy / withColumn` call only appends a node to a
-   Directed Acyclic Graph (the LINEAGE GRAPH).  The DAG is optimised and
-   turned into a physical plan, and the first element of data is only moved
-   when an ACTION is triggered.
-   Consequence (a classic viva question): "Nothing happened for 3 seconds and
-   then everything happened at once."  That is lazy evaluation + a full stage
-   build.  We keep `.filter()` calls *after* `.join()` where it matters so the
-   Catalyst optimiser can push the predicate down into the scan (predicate
-   pushdown) instead of shuffling 100% of the data.
+The Big Data core. One class, `PySparkInventoryEngine`, owns the whole
+pipeline and returns Pandas frames ready for the Streamlit UI.
 
-2) LINEAGE GRAPH
-   Every DataFrame carries a pointer to its parent DataFrames.  Spark builds
-   the DAG by reference (not by copying data), so memory stays flat.  It is
-   what makes fault tolerance possible: if a partition is lost, Spark replays
-   ONLY the lineage of that partition, not the whole job.  We demonstrate it by
-   calling `.explain()` -- that prints the lineage/plan tree.
+It is a CLASS, not a script, so the SparkSession lifecycle is encapsulated
+(create -> use -> stop) and the instance can be cached by Streamlit's
+`st.cache_resource`: the JVM starts once, not on every widget click.
 
-3) TRANSFORMATION vs ACTION
-   TRANSFORMATION (lazy, returns a new DataFrame):
-       select, filter, join, groupBy, withColumn, orderBy, distinct, drop...
-   ACTION (eager, triggers a Spark JOB, returns data to the driver / Python):
-       .show(), .count(), .collect(), .toPandas(), .write..., .first()
-   Our whole pipeline is ~30 transformations and exactly 3 actions.  We log
-   each action so you can point at the console during the viva and say:
-   "this is where the cluster actually did work".
+-------------------------------------------------------------------------------
+THE FOUR SPARK CONCEPTS THIS PROJECT DEMONSTRATES
+-------------------------------------------------------------------------------
+1. LAZY EVALUATION
+   `filter/join/groupBy/withColumn` execute NOTHING. Each call only appends a
+   node to a DAG (the lineage graph). The DAG is optimised into a physical
+   plan and runs only when an ACTION fires. Expect the classic viva question,
+   "nothing happened for 3 seconds then everything happened at once" -- that
+   is a full stage build. We order filters after joins so Catalyst can push
+   the predicate into the scan instead of shuffling all the data.
 
-4) SHUFFLE + PARTITIONING
-   A shuffle is a full data redistribution across executors; it is the most
-   expensive operation in Spark.  A shuffle is triggered by anything that
-   changes the row partitioning: groupBy, join (non-broadcast), distinct,
-   orderBy, window functions.  We MINIMISE shuffles by broadcasting the
-   small dimension tables (products, stock = 60 rows) via `F.broadcast()`,
-   exactly as a production pipeline would.
+2. LINEAGE GRAPH
+   Every DataFrame holds a *reference* to its parents rather than a copy of
+   the data, which keeps memory flat and makes fault tolerance possible: a
+   lost partition is rebuilt by replaying only its own lineage, not the whole
+   job. Call `.explain()` to print the graph.
 
-   We also lower `spark.sql.shuffle.partitions` from the default 200 to 8,
-   because on a local[*] machine 200 shuffle tasks would just be 200 tiny
-   tasks of pure overhead.  (200 is the right default for a real cluster.)
+3. TRANSFORMATION vs ACTION
+   Lazy, return a DataFrame: select, filter, join, groupBy, withColumn,
+   orderBy. Eager, trigger a real Spark job: toPandas, count, show, first,
+   write. This pipeline is ~40 transformations and exactly 6 actions, each one
+   logged with its duration so you can point at the console and say "this is
+   where the cluster actually did work".
 
-===============================================================================
-  THE ANALYTICAL PIPELINE (DAG, in execution order)
-===============================================================================
-    (1) READ     : 3 CSV partitions  -> strongly-typed DataFrames (StructType)
-    (2) AGG      : sales_ledger  --groupBy(product_id)--> revenue, units, COGS
-    (3) ABC      : window function (cumulative revenue %) -> Class A / B / C
-    (4) ITR      : COGS / average inventory value -> turnover ratio
-    (5) ALERTS   : stockout risk + dead stock (LEFT ANTI JOIN)
-    (6) UNIFY    : left-join every vector onto the product master (spine)
-    (7) ACTION   : toPandas() for the UI  +  a 1-row KPI aggregate
-    (8) STOP     : spark.stop() -- never leave a JVM running
+4. SHUFFLE & PARTITIONING
+   A shuffle redistributes rows across executors and is the most expensive
+   operation in Spark; groupBy, non-broadcast joins, distinct, orderBy and
+   windows all trigger one. We MINIMISE shuffles by broadcasting the 60-row
+   dimensions with F.broadcast(), and we lower shuffle.partitions from the
+   default 200 to 8 because 200 tiny tasks on one laptop is pure overhead
+   (200 is the right default on a real cluster).
 
-FINANCIAL DEFINITIONS USED (be ready to defend them)
-----------------------------------------------------
-* Revenue      = SUM(quantity_sold * price)              -> top-line sales
-* COGS         = SUM(quantity_sold * cost)               -> what the goods cost
-* Gross margin = Revenue - COGS
-* Opening stock (estimated) = current_stock + units_sold
-      Assumption: NO replenishment receipts landed inside the 90-day window
-      (i.e. the snapshot is "as of today" and every unit that left came out
-      of the shelf).  This is a documented simplification; with a real
-      purchase-order table we would join receipts in and compute a true
-      time-weighted average inventory.
-* Average inventory value = cost * (opening_stock + current_stock) / 2
-* Inventory Turnover Ratio (ITR, period) = COGS / average inventory value
-  "How many times did we sell and replace the entire average inventory during
-   the window?"  Annualised ITR = ITR_90d * (365 / window_days).
-* ABC classification: rank SKUs by revenue, walk down accumulating the
-  cumulative revenue share, and cut at 80% (A), 95% (B), 100% (C).
-  The SKU that PUSHES cumulative revenue across a threshold stays in the
-  higher class (a SKU is not "B" merely because one more unit would have
-  crossed 80%).  Implemented with an exclusive window frame
-  `rowsBetween(unboundedPreceding, -1)`.
+-------------------------------------------------------------------------------
+THE PIPELINE (the DAG, in execution order)
+-------------------------------------------------------------------------------
+   1. READ    3 CSV partitions -> strongly-typed DataFrames (StructType)
+   2. AGG     sales ledger --groupBy(product_id)--> revenue, units, COGS
+   3. SPINE   product master as the LEFT side, so dead stock is never lost
+   4. ABC     window over cumulative revenue % -> class A / B / C
+   5. ITR     COGS / average inventory value -> turnover + days of supply
+   6. ALERTS  stockout risk (<=) + dead stock (LEFT ANTI JOIN)
+   7. ACTION  toPandas() for the UI, plus a 1-row enterprise KPI aggregate
+   8. STOP    spark.stop() -- never leak a 1 GB JVM
 
-HOW TO RUN STANDALONE (useful for debugging without Streamlit)
---------------------------------------------------------------
+-------------------------------------------------------------------------------
+FINANCIAL DEFINITIONS (be ready to defend these)
+-------------------------------------------------------------------------------
+   Revenue        = SUM(quantity_sold * price)                   top-line sales
+   COGS           = SUM(quantity_sold * cost)
+   Gross margin   = Revenue - COGS
+   Opening stock  = current_stock + units_sold
+       Assumption: NO replenishment receipts landed inside the window, so
+       every unit that left came off the shelf. This is a documented
+       simplification -- with a real purchase-order table we would join
+       receipts in and compute a true time-weighted average inventory.
+   Avg inventory  = cost * (opening_stock + current_stock) / 2
+   ITR (period)   = COGS / avg inventory
+       "How many times did we sell and replace the whole average inventory?"
+   ITR (annual)   = ITR * 365 / window_days
+   days_of_supply = current_stock / avg_daily_demand
+       NULL for dead stock (no demand = infinite cover), which is correct.
+   ABC            rank SKUs by revenue, accumulate the cumulative revenue
+                   share, cut at 80% (A), 95% (B), 100% (C). The SKU that
+                   PUSHES the total across a threshold stays in the higher
+                   class -- see run_abc_analysis for the exclusive-frame trick.
+
+RUN STANDALONE (debug without Streamlit)
     python pyspark_analytics_engine.py
     python pyspark_analytics_engine.py --explain-plan
-================================================================================
-"""
+==============================================================================="""
 
 from __future__ import annotations
 
@@ -127,7 +108,6 @@ from hdfs_storage_mock import (
     hdfs_dataset_exists,
     print_dataset_summary,
     read_manifest,
-    to_hdfs_uri,
 )
 
 # =============================================================================
@@ -452,19 +432,15 @@ class PySparkInventoryEngine:
                 F.count(F.lit(1)).alias("txn_count"),
                 F.sum("revenue").alias("revenue"),
                 F.sum("cogs").alias("cogs"),
-                F.min("timestamp").alias("first_sale_ts"),
-                F.max("timestamp").alias("last_sale_ts"),
             )
             .cache()   # <- reuse this node 3x instead of recomputing it 3x
         )
         if self.verbose:
-            _log("Sales aggregation cached: {} SKUs with at least one sale "
-                 "(the 5 dead-stock SKUs are structurally absent).".format(
-                     self._expected_live_skus()))
+            _log("Sales aggregation registered for caching: consumed by the ABC "
+                 "analysis, the turnover analysis and the dead-stock anti join. "
+                 "It holds only the SKUs that appear in the ledger, so the dead "
+                 "stock is structurally absent by construction.")
         return aggregation
-
-    def _expected_live_skus(self) -> int:
-        return 60 - 5  # 60 master SKUs minus the 5 injected dead-stock SKUs
 
     # -------------------------------------------------------------------------
     # 3.4b  STEP 2b -- BUILD THE SKU SPINE  (the most important join in the job)
@@ -525,43 +501,24 @@ class PySparkInventoryEngine:
     def run_abc_analysis(self, sku_spine: DataFrame) -> DataFrame:
         """Classify every SKU as A / B / C from its revenue contribution.
 
-        The input is the 60-row SKU spine (master LEFT JOIN sales), so dead
-        stock is classified too -- with revenue 0 it naturally falls to the
-        bottom of the Pareto curve and lands in class "C", which is exactly
+        Input is the 60-row spine, so dead stock is classified too: with revenue
+        0 it falls to the bottom of the Pareto curve and lands in "C", which is
         the correct business answer.
 
-        THE ALGORITHM (this is the money slide of the viva)
-        -----------------------------------------------------
-        1. Order all SKUs by revenue DESCENDING (plus product_id as a
-           deterministic tie-break -- non-deterministic ordering would make
-           the classification flip between runs, which is unacceptable).
-        2. Use a window function to compute the CUMULATIVE revenue and the
-           cumulative revenue SHARE (%) from the top of the ranking.
-        3. Cut the Pareto curve at 80% and 95%.
+        THE SUBTLE RULE (the one to get right in the viva)
+            We classify a SKU by the cumulative share BEFORE adding itself:
+                prior_share = cumulative_share_of_all_SKUs_ranked_above_me
+                A if prior_share < 80,  B if prior_share < 95,  else C
+            So the SKU that PUSHES the total past 80% is still an "A" --
+            without it the business would have had under 80% of its revenue,
+            therefore it IS part of the 80%. A naive `cumulative_share <= 80`
+            pushes that critical SKU into class B: a real, common bug.
+            In Spark that "before" value is an EXCLUSIVE frame --
+            `rowsBetween(Window.unboundedPreceding, -1)` -- where -1 means
+            "one row above me", i.e. everything strictly before me.
 
-        THE SUBTLE BUSINESS RULE (most students get this wrong)
-        --------------------------------------------------------
-        We classify a SKU by the cumulative share BEFORE adding itself:
-            prior_share = cumulative_share_before_this_sku
-            A  if prior_share < 80
-            B  if prior_share < 95
-            C  otherwise
-        So the SKU that PUSHES the total past 80% is still an "A": without it
-        the business would have had less than 80% of its revenue, therefore it
-        IS part of the 80%.  A naive `cumulative_share <= 80` would instead
-        push that critical SKU into class B -- a real, and very common,
-        implementation bug.
-
-        SPARK MECHANICS
-        ---------------
-        * `Window.orderBy(...)` defines the frame; the frame is applied with
-          `rowsBetween(start, end)`.
-        * `Window.unboundedPreceding` = "from the very first row".
-        * end = -1 means "one row above the current row" -> an EXCLUSIVE
-          frame, i.e. "everything strictly before me". That is exactly the
-          "before adding itself" value we need.
-        * A window is the classic SHUFFLE trigger: rows must be grouped and
-          sorted by the window's partitioning before the function runs.
+        `product_id` is the orderBy tie-break: without it two SKUs with equal
+        revenue could swap between runs and the classes would be unstable.
         """
         # A Pareto running total is a *global* ranking: every SKU must be
         # compared against all the others, so all rows land in one partition.
@@ -683,13 +640,11 @@ class PySparkInventoryEngine:
             avg_daily_demand      = units_sold / window_days
             days_of_supply        = current_stock / avg_daily_demand
 
-        `days_of_supply` is the number a supply-chain manager actually looks at:
-        "at the current demand, how many days of cover do we have left?"  It is
-        NULL for dead stock (no demand -> infinite cover), which is exactly the
-        right answer semantically.
-
-        BOTH dimension tables were already BROADCAST-joined in
-        build_sku_spine, so this step costs zero shuffles.
+        `days_of_supply` answers the question a supply-chain manager actually
+        asks -- "at the current demand, how many days of cover are left?" It is
+        NULL for dead stock (no demand = infinite cover), which is the correct
+        semantic. The dimensions were already broadcast-joined in
+        build_sku_spine, so this step costs zero shuffles and zero I/O.
         """
         window_days = max(self.sales_window_days, 1)
 
@@ -751,29 +706,21 @@ class PySparkInventoryEngine:
         """Flag Stockout Risk and Dead Stock, then build a reorder plan.
 
         RULE 1 -- STOCKOUT RISK:  current_stock <= safety_stock_level
-            Note the `<=`, not `<`.  When on-hand stock EQUALS the buffer the
-            buffer is already fully consumed, so a replenishment order must go
-            out today.  Our generator injects exactly one such boundary SKU so
-            the dashboard proves the operator is `<=`.
+            Note `<=`, not `<`. When on-hand stock EQUALS the buffer the buffer
+            is already fully consumed, so a replenishment order must go out
+            today. The generator injects one such boundary SKU so the dashboard
+            proves the operator is `<=`.
 
-        RULE 2 -- DEAD STOCK: the SKU exists in the product master but NEVER
-            appears in the sales ledger.
-            The textbook Spark tool is a LEFT ANTI JOIN:
-                products.LEFT ANTI JOIN sales
-            It returns rows of the left side that found NO match on the right --
-            in ONE pass, and (crucially) WITHOUT the "COUNT(*) = 0" trick,
-            which is a well-known anti-pattern: it forces a full aggregation
-            of both sides, and it cannot be combined with the other columns.
-            A LEFT ANTI JOIN is a pure hash/sort-merge anti-join: it reads the
-            right side once, builds a key set, and streams the left side
-            through it.  Same result, one shuffle instead of two.
-
-            Why LEFT JOIN + NULL check is NOT good enough: with a LEFT JOIN you
-            must then `coalesce(units_sold, 0)` and you lose the distinction
-            between "never sold" and "sold but null-aggregated".  The anti join
-            keeps the semantics explicit.
+        RULE 2 -- DEAD STOCK: in the product master but NEVER in the ledger.
+            The right tool is a LEFT ANTI JOIN: it returns the rows of the left
+            side that found no match on the right, in ONE pass. The common
+            alternative, `COUNT(*) = 0`, is an anti-pattern -- it forces a full
+            aggregation of both sides and cannot combine with other columns. An
+            anti join reads the right side once, builds a key set, and streams
+            the left side through it: same answer, one shuffle instead of two.
+            A LEFT JOIN + NULL check is also worse, because `coalesce(units, 0)`
+            blurs the difference between "never sold" and "null-aggregated".
         """
-        # ---- Dead-stock detection: LEFT ANTI JOIN -------------------------
         # `sales_agg` contains ONLY SKUs that appear in the ledger, so the anti
         # join against it returns exactly the SKUs with zero transactions.
         dead_stock_skus = (

@@ -1,73 +1,52 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-================================================================================
+===============================================================================
 SMARTSTOCK :: HDFS STORAGE SIMULATION LAYER   (hdfs_storage_mock.py)
-================================================================================
+===============================================================================
 
-PURPOSE
--------
-This module is the *data lake ingestion simulator* of the SmartStock platform.
-It fakes a Hadoop Distributed File System (HDFS) directory tree on the local
-filesystem so that the whole project can run on a single laptop (Windows or
-macOS) without installing a real NameNode + DataNode cluster.
+The data-lake ingestion simulator. It fakes a Hadoop Distributed File System
+namespace on local disk so the whole project runs on one laptop (Windows or
+macOS) with no NameNode/DataNode cluster. On a real cluster the equivalent
+would be `hdfs dfs -mkdir -p ...` plus `hdfs dfs -put ...`; here we simply
+write real CSV bytes into a directory whose *name* mimics the HDFS layout, so
+every downstream layer reads a plain local path while *thinking* it is talking
+to HDFS.
 
-On a real cluster we would do this with:
-
-    hdfs dfs -mkdir -p /user/hadoop/inventory/raw/products
-    hdfs dfs -put  products.csv  /user/hadoop/inventory/raw/products/
-
-...or with a PySpark / Hadoop streaming ingestion job.  Here we simply write
-real CSV bytes into a directory whose *name* mimics the HDFS block layout, so
-that every downstream layer (PySpark, Streamlit) talks to a plain local path
-but *thinks* it is talking to HDFS.
-
-WHY THIS MATTERS FOR THE VIVA
------------------------------
-1.  HDFS is a Write-Once-Read-Many (WORM) store.  Our generator only ever
-    *creates* a fresh versioned dataset; the Streamlit app never mutates a
-    file in place -- it only reads.  That is exactly the HDFS contract.
-2.  HDFS stores data in large immutable *blocks* (default 128 MB) replicated
-    across DataNodes (default ReplicationFactor = 3).  Each of our three
-    "partitions" (products / stock / sales) below represents one logical
-    partition/dataset inside the RAW layer of the architecture.
-3.  HDFS optimises for *throughput*, not for small files.  Too many tiny
-    files create too many map tasks and kill NameNode memory.  That is why we
-    keep the dataset to a small number of well-formed CSV files rather than
-    2,500 one-row transaction files.
-4.  The `_SUCCESS` marker file we drop next to every dataset is a real Hadoop
-    convention: a job writes its output, and only then atomically commits the
-    `_SUCCESS` marker.  Downstream consumers use it to decide "is this
-    dataset complete and safe to read?"  (Real-world equivalent: Delta Lake
-    transaction commits / ACID.)
-
-DATASET WE GENERATE (RAW / un-processed zone)
---------------------------------------------
+Dataset written to the RAW (Bronze) layer:
     products.csv       60 unique SKUs across 5 categories
     stock.csv          current on-hand quantity per SKU
-    sales_ledger.csv   2,500 transactions spread over the last 90 days
+    sales_ledger.csv   2,500 transactions across the last 90 days
 
-INTENTIONALLY INJECTED EDGE CASES (the "test cases" of the project)
--------------------------------------------------------------------
-    * 5 DEAD STOCK SKUs      -> never appear in the sales ledger at all.
-                                (Detected later by a Spark LEFT ANTI JOIN.)
-    * 5 STOCKOUT RISK SKUs   -> on-hand stock is <= safety stock level.
-                                (Detected later by a Spark JOIN + filter.)
-    * 1 SKU exactly ON the safety-stock boundary, to prove the `<=` operator
-      (and not `<`) is the correct business rule.
+HDFS CONCEPTS THIS LAYER ACTUALLY MODELS (worth stating in the viva)
+    * WORM storage. We only ever create a fresh dataset; the app never mutates
+      a file in place, it only reads. That is the HDFS contract.
+    * Blocks + replication. Each dataset is one file, so it occupies exactly
+      one 128 MB block at RF=3 (see the constants below). Both are declared so
+      the console output and manifest read like a real Hadoop session.
+    * The `_SUCCESS` commit marker is a genuine Hadoop convention: write the
+      data first, commit the marker LAST. A consumer that finds no marker
+      refuses to read a half-written dataset -- which is why the dashboard
+      self-heals instead of crashing on partial input.
+
+INJECTED EDGE CASES (the project's test cases)
+    * 5 DEAD STOCK SKUs     -> never appear in the ledger at all
+                               (found later by a Spark LEFT ANTI JOIN).
+    * 5 STOCKOUT RISK SKUs  -> on-hand is <= the safety stock level
+                               (found later by a Spark filter).
+    * 1 SKU exactly ON the safety-level boundary, to prove the production rule
+      uses `<=` and not `<`.
 
 DETERMINISM
------------
-A fixed random seed is used, so every run of this file on every machine
-produces byte-identical CSVs.  This is essential for a graded project: the
-numbers in the report / viva demo will always match.
+    A fixed random seed makes the CSVs byte-identical on every machine, so the
+    numbers in your report always match the demo.
 
-HOW TO RUN
-----------
-    python hdfs_storage_mock.py                # generate only if missing
-    python hdfs_storage_mock.py --force        # wipe + regenerate
-    python hdfs_storage_mock.py --stats        # print a summary table
-================================================================================
+CLI
+    python hdfs_storage_mock.py                       # generate only if missing
+    python hdfs_storage_mock.py --force               # wipe + regenerate
+    python hdfs_storage_mock.py --stats               # show what is committed
+    python hdfs_storage_mock.py --transactions 2500000 # scale the demo up
+===============================================================================
 """
 
 from __future__ import annotations

@@ -1,61 +1,35 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-================================================================================
+===============================================================================
 SMARTSTOCK :: ENTERPRISE DASHBOARD   (main_app.py)
-================================================================================
+===============================================================================
 
-Streamlit front-end for the SmartStock HDFS & PySpark Inventory Analytics Suite.
+Streamlit front-end for the SmartStock HDFS & PySpark analytics suite.
 
-ARCHITECTURE (this is the slide you show first in the viva)
------------------------------------------------------------
-    +------------------------------------------------------------------+
-    |  HDFS RAW LAYER (simulated)   hdfs/user/hadoop/inventory/raw/    |
-    |      products.csv | stock.csv | sales_ledger.csv  + _SUCCESS     |
-    +--------------------------------+---------------------------------+
-                                     |
-                    (1) auto-bootstrap if the layer is not committed
-                                     v
-    +------------------------------------------------------------------+
-    |  PySparkInventoryEngine  (pyspark_analytics_engine.py)           |
-    |   read w/ StructType -> groupBy -> window(ABC) -> ITR -> flags    |
-    |   -> LEFT JOIN spine -> toPandas()  [ACTIONS]                     |
-    +--------------------------------+---------------------------------+
-                                     |
-                    (2) st.cache_resource: the SparkSession is created
-                        ONCE and reused across every widget interaction
-                                     v
-    +------------------------------------------------------------------+
-    |  Streamlit UI (this file)                                        |
-    |   sidebar filters -> KPI cards -> Plotly charts -> action table    |
-    |   filtering happens in Pandas on the 60-row result (a driver-sized|
-    |   payload), NOT in Spark -- see "WHERE THE WORK HAPPENS" below.    |
-    +------------------------------------------------------------------+
+    HDFS RAW layer (simulated, _SUCCESS committed)
+        -> auto-bootstrap if the layer is not committed
+        -> PySparkInventoryEngine: schema-on-read, groupBy, ABC window, ITR,
+           LEFT ANTI JOIN, broadcast joins, toPandas()  [ACTIONS]
+        -> st.cache_resource: the SparkSession is created ONCE and reused, so
+           every widget interaction costs milliseconds instead of ~20 s
+        -> sidebar filters -> KPI cards -> Plotly charts -> action table
 
-WHERE THE WORK HAPPENS  (the architecture question to be ready for)
----------------------------------------------------------------------
-* Spark  : all the *heavy* work -- parsing 2,500 typed rows, the shuffle
-           for the groupBy, the Pareto window, 3 broadcast joins.
-* Driver : all the *presentation* work -- filtering a 60-row Pandas frame
-           and drawing charts.  This split is deliberate: a Pandas DataFrame
-           is single-process, so shipping 2,500 raw rows to the UI on every
-           slider move would be wasteful, while shipping 2,500 *aggregated*
-           rows would be a design error.  We ship exactly 60.
-
-CACHING STRATEGY (why the dashboard feels instant)
---------------------------------------------------
-`st.cache_resource` caches the pipeline RESULT (and keeps the SparkSession
-alive) keyed on nothing, so moving a filter widget re-runs only the Pandas
-layer -- milliseconds instead of the ~20 s Spark job.  `st.cache_data` is
-*not* used here on purpose: it would hash and copy the frames, and we want
-the engine instance itself to be reused so its JVM is not restarted.
-================================================================================
+WHERE THE WORK HAPPENS
+    Spark   the heavy work: parsing 2,500 typed rows, the groupBy shuffle, the
+            Pareto window, the broadcast joins.
+    Driver  the presentation work: filtering a 60-row Pandas frame and drawing
+            charts.
+    That split is deliberate. A Pandas DataFrame is single-process, so pulling
+    2,500 raw rows to the UI on every slider move would be wasteful, while
+    pulling 2,500 *aggregated* rows would be a design error. We ship 60.
+===============================================================================
 """
 
 from __future__ import annotations
 
 import sys
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 import pandas as pd
 import streamlit as st
@@ -71,7 +45,6 @@ import plotly.express as px
 import plotly.graph_objects as go
 
 from hdfs_storage_mock import (
-    CATEGORIES,
     HDFS_LOCAL_ROOT,
     ensure_hdfs_dataset,
     hdfs_dataset_exists,
@@ -90,14 +63,29 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-#: Enterprise colour palette. Class A = the gold, class C = the problem.
+#: Enterprise colour palette. Class A = healthy gold, class C = the problem.
 ABC_COLORS = {"A": "#00b894", "B": "#fdcb6e", "C": "#e17055"}
 SEVERITY_COLORS = {
     "CRITICAL": "#d63031", "HIGH": "#e17055",
     "MEDIUM": "#fdcb6e", "OK": "#00b894",
 }
-PRIMARY = "#0b3c5d"      # deep navy - headers / sidebar
-ACCENT = "#1d7874"       # teal - buttons, accents
+ACCENT = "#1d7874"       # teal - KPI card accent bar
+
+#: Default (i.e. "no filter") value of every sidebar widget. Kept in one place
+#: so the reset button can never drift out of sync with the widgets themselves.
+FILTER_DEFAULTS: Dict[str, object] = {
+    "filter_category": [],
+    "filter_abc_class": [],
+    "filter_zone": [],
+    "filter_severity": [],
+    "filter_min_revenue": 0,
+    "filter_only_alerts": False,
+}
+
+
+def _reset_filters() -> None:
+    """on_click callback for the reset button (see the call site)."""
+    st.session_state.update(FILTER_DEFAULTS)
 
 CSS = """
 <style>
@@ -347,45 +335,59 @@ def render_sidebar(products: pd.DataFrame, meta: Dict[str, object]
 
     st.sidebar.subheader("🔎 Filters")
 
-    # Category multiselect ("All" == empty selection, the Streamlit idiom).
+    # Every filter widget gets an explicit session-state key. That is what makes
+    # the "Reset all filters" button below able to restore the defaults:
+    # Streamlit only lets you programmatically change a widget's value if you
+    # can address it by key.
+    #
+    # Streamlit idiom: an EMPTY multiselect means "no filter" (show everything).
     selected_categories = st.sidebar.multiselect(
         "Product Category",
         options=sorted(products["category"].unique()),
         default=[],
         placeholder="All categories",
+        key="filter_category",
     )
     selected_classes = st.sidebar.multiselect(
         "ABC Inventory Class",
         options=["A", "B", "C"],
         default=[],
         placeholder="All classes (A / B / C)",
+        key="filter_abc_class",
     )
     selected_zones = st.sidebar.multiselect(
         "Warehouse Zone",
         options=sorted(products["warehouse_zone"].dropna().unique()),
         default=[],
         placeholder="All zones",
+        key="filter_zone",
     )
     selected_severities = st.sidebar.multiselect(
         "Alert Severity",
         options=["CRITICAL", "HIGH", "MEDIUM", "OK"],
         default=[],
         placeholder="All severities",
+        key="filter_severity",
     )
     min_revenue = st.sidebar.slider(
         "Minimum SKU revenue ($)", min_value=0,
         max_value=int(max(products["revenue"].max(), 1)),
         value=0, step=500,
+        key="filter_min_revenue",
     )
     only_alerts = st.sidebar.toggle(
         "Show only items needing action", value=False,
         help="Hides fully healthy SKUs (alert_severity == OK).",
+        key="filter_only_alerts",
     )
 
-    if st.sidebar.button("↺ Reset all filters", width="stretch"):
-        for key in ("cat", "cls", "zone", "sev"):
-            st.session_state.pop("__reset_{}".format(key), None)
-        st.rerun()
+    # `on_click` is essential here, not decorative: a callback runs BEFORE the
+    # widgets are re-instantiated on the next run, which is the only legal
+    # moment to write to a widget's session state. Setting the same keys from
+    # inside the script body raises
+    # "cannot be modified after the widget with key ... is instantiated".
+    st.sidebar.button("↺ Reset all filters", on_click=_reset_filters,
+                      width="stretch")
 
     # ---------------- system status panel ----------------
     st.sidebar.markdown("---")
@@ -574,11 +576,11 @@ def chart_abc_distribution(abc: pd.DataFrame) -> None:
                     config={"displayModeBar": False})
 
 
-def chart_pareto_curve(products: pd.DataFrame, window_days: int = 90) -> None:
+def chart_pareto_curve(products: pd.DataFrame) -> None:
     """Pareto: bar = revenue per SKU, line = cumulative revenue %.
 
-    This is the visual proof of the ABC cut performed by the Spark window
-    function: the line crosses 80% and 95% exactly where the classes change.
+    Visual proof of the ABC cut done by the Spark window function: the line
+    crosses 80% and 95% exactly where the classes change.
     """
     ordered = products.sort_values("revenue", ascending=False).head(25).copy()
     ordered["cumulative_pct"] = (
@@ -806,6 +808,14 @@ dashboard exists to alert on. Dimension tables drive report shape; facts never d
    total of revenue, cut at 80% and 95%. The SKU that *pushes* the cumulative
    total across a threshold stays in the higher class — we use an **exclusive**
    frame (`rowsBetween(unboundedPreceding, -1)`) to get the "before" value.
+
+**Two design decisions worth highlighting**
+- The **product master is the LEFT spine** of every join. An inner join would
+  silently drop the five dead-stock SKUs — the exact rows this dashboard
+  exists to alert on.
+- **`.cache()` on the sales aggregation**, because that node feeds three
+  downstream consumers. Without it Spark re-scans and re-shuffles the ledger
+  three times.
 """)
         if meta.get("actions"):
             total_actions = len(meta["actions"])
@@ -912,7 +922,7 @@ def main() -> None:
         section_head("📈", "Pareto Curve — Revenue Concentration",
                      "The Spark window function made visual: the dashed lines "
                      "mark the 80% and 95% ABC cut-offs.")
-        chart_pareto_curve(products, window_days=int(meta.get("sales_window_days") or 90))
+        chart_pareto_curve(products)
 
         # ---- 6. ACTION TABLE ----------------------------------------------
         section_head("🛠️", "Immediate Restock Actions Required",
