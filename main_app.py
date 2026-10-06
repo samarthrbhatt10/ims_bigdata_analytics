@@ -297,6 +297,13 @@ CSS = """
 .upload-hint { font-size: .68rem; color: #9dbdd4; line-height: 1.5;
                margin: .2rem 0 .5rem; }
 .upload-hint b { color: #ffffff; font-weight: 600; }
+/* Readiness checklist: which of the three datasets has been recognised. */
+.rdy { display: flex; align-items: center; gap: .42rem;
+       font-size: .74rem; line-height: 1.75; color: #cfe0ec; }
+.rdy-mark { font-weight: 700; width: 1em; text-align: center; }
+.rdy-mark.ok { color: #6fe0b8; }
+.rdy-mark.no { color: #7f96a8; }
+.rdy-txt   { font-variant-numeric: tabular-nums; }
 /* File-uploader drop zone on the navy sidebar. */
 [data-testid="stFileUploaderDropzone"] {
     background: rgba(255,255,255,.06) !important;
@@ -555,16 +562,58 @@ def render_data_source() -> Tuple[str, Optional[Dict[str, object]]]:
         st.sidebar.caption("No files selected yet.")
         return "sample", None
 
-    # Once files are chosen we ingest them on the next click, so a rerun is not
-    # triggered by the upload widget itself.
-    if st.sidebar.button("Analyse these files", type="primary",
-                         width="stretch"):
+    # ---- READINESS: detect on every rerun, before any click ---------------
+    # Detecting here rather than inside the click handler lets the sidebar
+    # TELL the user what is still missing, and keeps the button disabled
+    # until all three datasets are present. Failing at the gate is right, but
+    # failing BEFORE the user commits beats failing after.
+    payload = [(f.name, f.getvalue()) for f in files]
+    mapping, detect_notes = data_upload.detect_datasets(payload)
+    missing = [d for d in ("products", "stock", "sales") if d not in mapping]
+    ready = not missing
+
+    # Per-dataset checklist. Glyphs + colour rather than HTML chips, because
+    # the sidebar sanitises markup.
+    st.sidebar.markdown(
+        "".join(
+            '<div class="rdy"><span class="rdy-mark {}">{}</span>'
+            '<span class="rdy-txt">{}</span></div>'.format(
+                "ok" if d in mapping else "no",
+                "✓" if d in mapping else "○",
+                d.capitalize())
+            for d in ("products", "stock", "sales")),
+        unsafe_allow_html=True)
+
+    if not ready:
+        st.sidebar.caption(
+            "Still needed: {} — attach {} more file{}.".format(
+                ", ".join(missing), len(missing),
+                "" if len(missing) == 1 else "s"))
+
+    # Disabled until all three are recognised, which makes the "missing
+    # dataset" error unreachable in the normal flow.
+    st.sidebar.button(
+        "Analyse these files",
+        type="primary", width="stretch", disabled=not ready,
+        help=("All three datasets detected." if ready
+              else "Waiting for: {}".format(", ".join(missing))))
+
+    # Escape hatch: a user who is missing a file can go straight to a working
+    # console instead of being stuck on a disabled button.
+    if not ready and st.sidebar.button("Use sample data instead",
+                                      width="stretch"):
+        st.session_state["data_source_mode"] = "Sample dataset"
+        st.rerun()
+
+    if not ready:
+        return "sample", None
+
+    # Ingest on click, so merely selecting files does not trigger a rerun.
+    if st.sidebar.button("Analyse now", type="primary", width="stretch"):
         try:
-            payload = [(f.name, f.getvalue()) for f in files]
-            mapping, notes = data_upload.detect_datasets(payload)
             paths, manifest = data_upload.persist_uploaded_dataset(mapping)
             st.session_state["upload_manifest"] = manifest
-            st.session_state["upload_notes"] = notes
+            st.session_state["upload_notes"] = detect_notes
             st.session_state["upload_error"] = None
             st.cache_resource.clear()
             st.rerun()

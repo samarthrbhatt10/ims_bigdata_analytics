@@ -418,11 +418,13 @@ def persist_uploaded_dataset(mapping: Dict[str, Tuple[str, bytes]]
     missing = [d for d in ("products", "stock", "sales") if d not in mapping]
     if missing:
         raise UploadError(
-            "Missing required dataset(s): {}. Upload all three CSVs -- the "
-            "inventory analytics cannot be computed from a partial feed, "
-            "because the missing one would silently zero out metrics it "
-            "cannot actually measure. Expected column headers -- {}."
-            .format(", ".join(missing),
+            "Missing dataset(s): {}. All three are required. The analytics "
+            "join all of them, and a missing feed would silently zero out a "
+            "metric it cannot actually measure -- with no stock.csv the "
+            "console reports $0 trapped capital, which reads as 'none' "
+            "rather than 'unknown'. Attach {} more file{}. Expected headers: {}."
+            .format(", ".join(missing), len(missing),
+                    "" if len(missing) == 1 else "s",
                     " | ".join("{}: {}".format(d, ", ".join(REQUIRED_COLUMNS[d]))
                                for d in missing)))
 
