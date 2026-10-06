@@ -316,6 +316,14 @@ CSS = """
 [data-testid="stFileUploaderDropzone"] button {
     color: #e6eef4 !important; background: rgba(255,255,255,.12) !important;
     border: 1px solid rgba(255,255,255,.30) !important; }
+/* Filename and size of each attached file. Streamlit renders these with the
+   LIGHT theme's near-black on the chip background, which on our navy sidebar
+   measured 1.45:1 -- effectively invisible. Selector confirmed by inspecting
+   the live DOM (data-testid=stFileUploaderFileName), not guessed. */
+[data-testid="stFileUploaderFileName"],
+[data-testid="stFileUploaderFileSize"],
+[data-testid="stFileUploaderFile"] { color: #cfe0ec !important; }
+[data-testid="stFileUploaderFileName"] { font-weight: 600; }
 .kv { font-size: .73rem; line-height: 1.75; color: #cfe0ec;
       font-variant-numeric: tabular-nums; }
 .kv b { color: #ffffff; font-weight: 600; }
@@ -521,13 +529,24 @@ def rollup(products: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str
 # SECTION 5 :: SIDEBAR
 # =============================================================================
 
+def render_sidebar_brand() -> None:
+    """Branding block. Rendered FIRST, on its own, because Streamlit renders
+    sidebar elements in call order -- emitting it from render_sidebar() put the
+    product name in the middle of the panel, below the upload control."""
+    st.sidebar.markdown(
+        '<div class="side-title">▦ SmartStock</div>'
+        '<div class="side-sub">Inventory Control Tower &middot; HDFS × PySpark</div>',
+        unsafe_allow_html=True,
+    )
+    st.sidebar.markdown("---")
+
+
 def render_data_source() -> Tuple[str, Optional[Dict[str, object]]]:
     """The drag-and-drop data source control. Returns (dataset_key, manifest).
 
     `dataset_key` is either the literal "sample" or the content-addressed id of
     an accepted upload, and it is what keys the pipeline cache.
     """
-    st.sidebar.markdown("---")
     st.sidebar.markdown('<div class="side-h">Data source</div>',
                         unsafe_allow_html=True)
 
@@ -592,24 +611,25 @@ def render_data_source() -> Tuple[str, Optional[Dict[str, object]]]:
 
     # Disabled until all three are recognised, which makes the "missing
     # dataset" error unreachable in the normal flow.
-    st.sidebar.button(
+    # ONE button, whose return value drives the ingest. An earlier version
+    # rendered an enabled "Analyse these files" whose return value was
+    # discarded and put the real handler on a second button -- so the
+    # prominent button looked clickable and did nothing.
+    clicked = st.sidebar.button(
         "Analyse these files",
         type="primary", width="stretch", disabled=not ready,
         help=("All three datasets detected." if ready
               else "Waiting for: {}".format(", ".join(missing))))
 
-    # Escape hatch: a user who is missing a file can go straight to a working
-    # console instead of being stuck on a disabled button.
-    if not ready and st.sidebar.button("Use sample data instead",
-                                      width="stretch"):
-        st.session_state["data_source_mode"] = "Sample dataset"
-        st.rerun()
-
     if not ready:
+        # Escape hatch: a user missing a file is never stranded on a
+        # permanently disabled button.
+        if st.sidebar.button("Use sample data instead", width="stretch"):
+            st.session_state["data_source_mode"] = "Sample dataset"
+            st.rerun()
         return "sample", None
 
-    # Ingest on click, so merely selecting files does not trigger a rerun.
-    if st.sidebar.button("Analyse now", type="primary", width="stretch"):
+    if clicked:
         try:
             paths, manifest = data_upload.persist_uploaded_dataset(mapping)
             st.session_state["upload_manifest"] = manifest
@@ -641,13 +661,10 @@ def render_data_source() -> Tuple[str, Optional[Dict[str, object]]]:
 
 def render_sidebar(products: pd.DataFrame, meta: Dict[str, object]
                    ) -> Dict[str, object]:
-    st.sidebar.markdown(
-        '<div class="side-title">▦ SmartStock</div>'
-        '<div class="side-sub">Inventory Control Tower &middot; HDFS × PySpark</div>',
-        unsafe_allow_html=True,
-    )
+    """Filter widgets + pipeline status. Branding is emitted separately by
+    render_sidebar_brand() so the panel reads top-down: brand, data source,
+    filters, pipeline."""
     st.sidebar.markdown("---")
-
     st.sidebar.markdown('<div class="side-h">Filters</div>',
                         unsafe_allow_html=True)
     selected_categories = st.sidebar.multiselect(
@@ -1224,7 +1241,10 @@ which we do not have.
 # =============================================================================
 
 def main() -> None:
-    # ---- 1. DATA SOURCE: sample dataset, or an accepted upload ------------
+    # ---- 1. SIDEBAR BRAND, then the data-source control ------------------
+    # Order matters: Streamlit renders sidebar widgets in call order, so the
+    # brand must be emitted before the upload panel or it appears underneath it.
+    render_sidebar_brand()
     # Rendered before anything else so a rejection is the first thing the user
     # sees, rather than a stack trace after a Spark run.
     dataset_key, upload_manifest = render_data_source()
