@@ -74,3 +74,6 @@ r.csv
 v.csv
 out.csv
 inventory_analytics.csv
+
+# Sample CSVs used to demo the drag-and-drop uploader.
+testdata/

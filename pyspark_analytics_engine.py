@@ -104,6 +104,7 @@ import atexit
 import sys
 import time
 import warnings
+from pathlib import Path
 from typing import Dict, Optional
 
 from pyspark.sql import DataFrame, SparkSession, Window
@@ -198,6 +199,16 @@ class PySparkInventoryEngine:
         False -> PERMISSIVE: bad values become NULL.  Convenient for demos.
     sales_window_days_override : int, optional
         Force the analysis window instead of auto-detecting it from the data.
+    dataset_paths : dict, optional
+        Explicit {dataset_name: Path} to read instead of the built-in sample.
+        This is the seam that lets the dashboard analyse a user's uploaded CSVs
+        through the IDENTICAL pipeline -- only the bytes on disk change, so the
+        schemas, the DAG and every downstream transformation stay unchanged.
+    missing_policy : str
+        What to do when a named dataset has no file. "error" raises; "empty"
+        substitutes a correctly-typed EMPTY DataFrame, which is how a partial
+        upload is handled -- a missing sales feed should show zero revenue, not
+        crash the console.
     verbose : bool
         Print stage timings and the physical plan.
     """
@@ -210,13 +221,26 @@ class PySparkInventoryEngine:
         shuffle_partitions: int = 8,
         strict_ingestion: bool = True,
         sales_window_days_override: Optional[int] = None,
+        dataset_paths: Optional[Dict[str, Path]] = None,
+        missing_policy: str = "error",
         verbose: bool = True,
     ) -> None:
         self.app_name = app_name
         self.shuffle_partitions = shuffle_partitions
         self.strict_ingestion = strict_ingestion
         self.sales_window_days_override = sales_window_days_override
+        self.missing_policy = missing_policy
         self.verbose = verbose
+
+        # The sample dataset is the default; the dashboard passes a different
+        # mapping when the user uploads their own CSVs.
+        self.dataset_paths: Dict[str, Path] = dict(
+            dataset_paths or {
+                "products": PRODUCTS_CSV,
+                "stock": STOCK_CSV,
+                "sales": SALES_CSV,
+            }
+        )
 
         self.spark: Optional[SparkSession] = None
         self.sales_window_days: int = sales_window_days_override or 0
@@ -351,19 +375,69 @@ class PySparkInventoryEngine:
         """Build the three typed DataFrames of the RAW layer.
 
         REMEMBER: still zero execution.  We now have a 3-node DAG.
+
+        A dataset with no file is either an error or an empty typed frame,
+        depending on `missing_policy`. The empty frame still carries the full
+        StructType, so every downstream column reference stays valid -- that is
+        what lets a partial upload produce a meaningful (if sparse) report
+        instead of a NameResolutionException halfway down the DAG.
         """
-        products = self._read_csv(PRODUCTS_CSV, PRODUCTS_SCHEMA)
-        stock = self._read_csv(STOCK_CSV, STOCK_SCHEMA)
-        sales = self._read_csv(SALES_CSV, SALES_SCHEMA)
+        schemas = {
+            "products": PRODUCTS_SCHEMA,
+            "stock": STOCK_SCHEMA,
+            "sales": SALES_SCHEMA,
+        }
+        frames: Dict[str, DataFrame] = {}
+
+        # Work out what is absent FIRST, so a strict-mode failure names every
+        # missing dataset at once instead of surfacing them one restart at a
+        # time. This MUST iterate the canonical schema keys rather than
+        # dataset_paths: a caller who passes {"products": p} has omitted stock
+        # and sales entirely, and iterating the dict's own keys would miss them.
+        absent = [name for name in schemas
+                  if self.dataset_paths.get(name) is None
+                  or not Path(self.dataset_paths[name]).exists()]
+        if absent and self.missing_policy == "error":
+            raise FileNotFoundError(
+                "No file supplied for: {}. Every dataset is required -- the "
+                "analytics join all three, and a missing feed would silently "
+                "zero out metrics it cannot measure. (Pass "
+                "missing_policy='empty' to substitute empty frames instead.)"
+                .format(", ".join(absent)))
+
+        for name, schema in schemas.items():
+            path = self.dataset_paths.get(name)
+            if path is not None and Path(path).exists():
+                frames[name] = self._read_csv(path, schema)
+                continue
+
+            # An explicitly typed empty frame. Built with a SQL projection
+            # rather than `spark.createDataFrame([], schema)`: the latter has to
+            # round-trip an empty Python collection through a worker process,
+            # which is both slower and a real failure point ("Python worker
+            # failed to connect back") on a busy or freshly-started JVM. The SQL
+            # route is resolved entirely inside Catalyst, so it cannot fail for
+            # that reason -- and `WHERE 1=0` guarantees zero rows.
+            assert self.spark is not None
+            projection = ", ".join(
+                "CAST(NULL AS {}) AS {}".format(
+                    field.dataType.simpleString(), field.name)
+                for field in schema.fields
+            )
+            frames[name] = self.spark.sql(
+                "SELECT {} WHERE 1=0".format(projection))
+            if self.verbose:
+                _log("{:<9} -> no file supplied; using an empty typed frame "
+                     "(partial upload)".format(name))
 
         if self.verbose:
             _log("Lineage built (lazy). Inferred/cast schema check:")
-            for name, df in (("products", products), ("stock", stock), ("sales", sales)):
+            for name, df in frames.items():
                 _log("   {:<9} -> {}".format(name, ", ".join(
                     "{}:{}".format(field.name, field.dataType.simpleString())
                     for field in df.schema.fields)))
 
-        return {"products": products, "stock": stock, "sales": sales}
+        return frames
 
     def _detect_sales_window(self, sales: DataFrame) -> int:
         """Auto-detect the analysis window (in days) covered by the ledger.
@@ -1082,12 +1156,13 @@ class PySparkInventoryEngine:
         budget. This is the difference between a report and a tool.
 
         The two estimates, stated honestly:
-          * LOST MARGIN (stockout) = the revenue we WOULD have earned on the
+          * LOST MARGIN (stockout) = the margin we WOULD have earned on the
             units we could not sell, valued at the SKU's gross margin rate.
-            We approximate the unsellable quantity as the safety-stock gap --
-            i.e. the units that a correctly-sized buffer would have covered.
-            This UNDERSTATES the true loss (customers may defect to a
-            competitor permanently), which is why the real figure is worse.
+            We size the shortfall against the SKU's own observed daily demand
+            over one lead time -- a defensible LOWER BOUND, because it ignores
+            customers who defect to a competitor permanently, so the true loss
+            is worse. Clamped at zero: a SKU priced below cost has a negative
+            margin rate, and you cannot lose negative margin by not selling.
           * TRAPPED CAPITAL (dead stock) = the cost of the units sitting on the
             shelf, valued at cost, not at retail. Retail value would flatter it.
         """
@@ -1124,9 +1199,18 @@ class PySparkInventoryEngine:
             )
             .withColumn(
                 "lost_margin_estimate",
+                # GREATEST(0, ...) is load-bearing. A SKU priced BELOW cost has
+                # a negative gross-margin rate, which would make "lost margin"
+                # NEGATIVE -- an amount you cannot lose by failing to sell. We
+                # clamp at zero and instead surface those lines as a data-quality
+                # warning in the upload layer, which is where they are fixable.
                 F.round(
-                    F.col("unsellable_units") * F.coalesce(gross_margin_rate, F.lit(0.0))
-                    * F.col("price"),
+                    F.greatest(
+                        F.lit(0.0),
+                        F.col("unsellable_units")
+                        * F.coalesce(gross_margin_rate, F.lit(0.0))
+                        * F.col("price"),
+                    ),
                     2,
                 ),
             )
@@ -1174,7 +1258,17 @@ class PySparkInventoryEngine:
         assert self.spark is not None
         pipeline_start = time.perf_counter()
 
-        if not hdfs_dataset_exists():
+        # Only auto-generate when we are pointed at the built-in sample. If the
+        # caller supplied explicit paths (an upload), generating the sample
+        # would be wrong: it would silently analyse the wrong data.
+        using_sample = all(
+            Path(p).resolve() == default.resolve()
+            for p, default in zip(
+                [self.dataset_paths.get(k) for k in ("products", "stock", "sales")],
+                [PRODUCTS_CSV, STOCK_CSV, SALES_CSV])
+            if p is not None
+        )
+        if using_sample and not hdfs_dataset_exists():
             _log("RAW layer not committed on HDFS -> bootstrapping it now ...")
             ensure_hdfs_dataset()
 
@@ -1312,15 +1406,26 @@ class PySparkInventoryEngine:
         assert kpi_row is not None
         # Normalise the Row into a plain dict of floats (long/int -> float),
         # then re-cast the genuine counters back to int for the UI.
+        #
+        # The `None -> 0.0` arm is load-bearing. Spark's F.sum() over an EMPTY
+        # partition returns NULL, not 0, so a dataset with no sales rows yields
+        # None for every total. Left as None, the first `{:,.2f}` format in the
+        # console summary raises
+        # "unsupported format string passed to NoneType.__format__". A missing
+        # feed legitimately means zero, so we say so explicitly rather than
+        # letting a None leak into the formatting layer.
         kpis: Dict[str, object] = {
-            key: (float(value) if isinstance(value, (int, float)) else value)
+            key: (float(value)
+                  if isinstance(value, (int, float))
+                  else (0.0 if value is None else value))
             for key, value in kpi_row.asDict().items()
         }
-        kpis["total_products"] = int(kpis["total_products"])
-        kpis["total_categories"] = int(kpis["total_categories"])
-        kpis["stockout_risk_items"] = int(kpis["stockout_risk_items"])
-        kpis["dead_stock_items"] = int(kpis["dead_stock_items"])
-        kpis["warehouse_zones"] = int(kpis["warehouse_zones"])
+        # Counters that must be ints for the UI's "{:,d}" style formatting.
+        for counter in ("total_products", "total_categories",
+                        "stockout_risk_items", "dead_stock_items",
+                        "warehouse_zones", "under_buffered_skus",
+                        "over_buffered_skus", "censored_demand_skus"):
+            kpis[counter] = int(kpis.get(counter) or 0)
 
         # Enterprise turnover ratio = total COGS / total average inventory value.
         # NULLIF protects against an empty inventory.
@@ -1335,14 +1440,6 @@ class PySparkInventoryEngine:
             if kpis["total_revenue"] else 0.0, 2)
         kpis["pending_reorder_value"] = kpis.get("pending_reorder_value") or 0.0
         kpis["pending_reorder_units"] = int(kpis.get("pending_reorder_units") or 0)
-        # Economic-impact KPIs, defaulting to 0.0 when the frame is empty.
-        for key in ("total_lost_margin", "total_lost_revenue",
-                    "total_trapped_capital", "total_net_exposure",
-                    "avg_demand_cv", "peak_demand_cv"):
-            kpis[key] = kpis.get(key) or 0.0
-        kpis["under_buffered_skus"] = int(kpis.get("under_buffered_skus") or 0)
-        kpis["over_buffered_skus"] = int(kpis.get("over_buffered_skus") or 0)
-        kpis["censored_demand_skus"] = int(kpis.get("censored_demand_skus") or 0)
         # Net exposure as a share of revenue: the single most persuasive number
         # in a planning meeting ("this is X% of our top line at risk").
         kpis["net_exposure_pct_of_revenue"] = round(

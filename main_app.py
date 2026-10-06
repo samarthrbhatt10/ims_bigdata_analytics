@@ -55,6 +55,8 @@ import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
 
+import data_upload
+from data_upload import UPLOADS_ROOT, UploadError
 from hdfs_storage_mock import (
     HDFS_LOCAL_ROOT,
     ensure_hdfs_dataset,
@@ -181,6 +183,14 @@ CSS = """
 .appbar .meta { font-size: .74rem; color: #cfe0ec; display: flex; gap: 1.1rem;
                 flex-wrap: nowrap; white-space: nowrap; }
 .appbar .meta b { color: #ffffff; font-weight: 600; }
+/* Source badge: which dataset the figures below actually came from. */
+.appbar .src { font-size: .6rem; font-weight: 700; letter-spacing: .09em;
+               padding: .14rem .42rem; border-radius: 4px;
+               vertical-align: middle; margin-left: .35rem; }
+.appbar .src        { background: rgba(255,255,255,.16); color: #cfe0ec;
+                      border: 1px solid rgba(255,255,255,.30); }
+.appbar .src-upload { background: #7fb8dc; color: #06263d;
+                      border: 1px solid #7fb8dc; }
 
 /* ---- Section headers ---------------------------------------------------- */
 .sec { display: flex; align-items: baseline; gap: .5rem;
@@ -284,6 +294,21 @@ CSS = """
 .side-sub { font-size: .7rem; color: #9dbdd4; margin-top: .1rem; }
 .side-h { font-size: .63rem; font-weight: 700; letter-spacing: .09em;
           text-transform: uppercase; color: #7fb8dc; margin: .3rem 0 .1rem; }
+.upload-hint { font-size: .68rem; color: #9dbdd4; line-height: 1.5;
+               margin: .2rem 0 .5rem; }
+.upload-hint b { color: #ffffff; font-weight: 600; }
+/* File-uploader drop zone on the navy sidebar. */
+[data-testid="stFileUploaderDropzone"] {
+    background: rgba(255,255,255,.06) !important;
+    border: 1px dashed rgba(255,255,255,.40) !important;
+    border-radius: 8px !important; }
+[data-testid="stFileUploaderDropzone"] small,
+[data-testid="stFileUploaderDropzoneInstructions"] div span,
+[data-testid="stFileUploaderDropzoneInstructions"] span {
+    color: #cfe0ec !important; }
+[data-testid="stFileUploaderDropzone"] button {
+    color: #e6eef4 !important; background: rgba(255,255,255,.12) !important;
+    border: 1px solid rgba(255,255,255,.30) !important; }
 .kv { font-size: .73rem; line-height: 1.75; color: #cfe0ec;
       font-variant-numeric: tabular-nums; }
 .kv b { color: #ffffff; font-weight: 600; }
@@ -408,15 +433,29 @@ def bootstrap_hdfs_layer() -> Dict[str, object]:
 
 @st.cache_resource(show_spinner="Running the PySpark pipeline "
                                "(first run also starts the Spark JVM) ...")
-def load_pipeline() -> Dict[str, object]:
-    """Execute the Spark pipeline ONCE and cache it for the session.
+def load_pipeline(dataset_key: str = "sample") -> Dict[str, object]:
+    """Execute the Spark pipeline ONCE per dataset and cache it.
 
     st.cache_resource (not st.cache_data) keeps the engine instance -- and so
     its SparkContext/JVM -- alive between reruns, which is why filtering is
     instant rather than costing a fresh ~14 s Spark job.
+
+    `dataset_key` is part of the cache key. It is the CONTENT-ADDRESSED id of
+    an upload (a hash of the bytes), so:
+      * re-uploading identical files reuses the cached result, and
+      * uploading different files correctly re-runs Spark.
+    Using a random nonce here would defeat the cache on every interaction;
+    using the filename would collide across different contents.
     """
-    bootstrap_hdfs_layer()
-    engine = PySparkInventoryEngine(verbose=True)
+    if dataset_key == "sample":
+        bootstrap_hdfs_layer()
+        engine = PySparkInventoryEngine(verbose=True)
+    else:
+        root = UPLOADS_ROOT / dataset_key
+        paths = {name: root / "{}.csv".format(name)
+                 for name in ("products", "stock", "sales")}
+        engine = PySparkInventoryEngine(
+            dataset_paths=paths, missing_policy="error", verbose=True)
     results = engine.run_pipeline()
     results["engine"] = engine
     return results
@@ -475,6 +514,82 @@ def rollup(products: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str
 # SECTION 5 :: SIDEBAR
 # =============================================================================
 
+def render_data_source() -> Tuple[str, Optional[Dict[str, object]]]:
+    """The drag-and-drop data source control. Returns (dataset_key, manifest).
+
+    `dataset_key` is either the literal "sample" or the content-addressed id of
+    an accepted upload, and it is what keys the pipeline cache.
+    """
+    st.sidebar.markdown("---")
+    st.sidebar.markdown('<div class="side-h">Data source</div>',
+                        unsafe_allow_html=True)
+
+    mode = st.sidebar.radio(
+        "Source", ["Sample dataset", "Upload my own CSVs"],
+        index=0, key="data_source_mode",
+        format_func=lambda m: m,
+    )
+
+    if mode == "Sample dataset":
+        if st.sidebar.button("Use sample dataset", width="stretch"):
+            data_upload.clear_uploads()
+            st.cache_resource.clear()
+            st.session_state["upload_manifest"] = None
+            st.session_state["upload_error"] = None
+            st.rerun()
+        if st.session_state.get("upload_manifest"):
+            st.sidebar.caption("Currently analysing: sample dataset.")
+        return "sample", st.session_state.get("upload_manifest")
+
+    # ---- Upload path -----------------------------------------------------
+    st.sidebar.markdown(
+        '<div class="upload-hint">Drag three CSVs here. Each is matched to a '
+        'dataset by its <b>column headers</b>, not its filename.</div>',
+        unsafe_allow_html=True,
+    )
+    files = st.sidebar.file_uploader(
+        "CSV files", type=["csv"], accept_multiple_files=True,
+        key="csv_upload", label_visibility="collapsed")
+
+    if not files:
+        st.sidebar.caption("No files selected yet.")
+        return "sample", None
+
+    # Once files are chosen we ingest them on the next click, so a rerun is not
+    # triggered by the upload widget itself.
+    if st.sidebar.button("Analyse these files", type="primary",
+                         width="stretch"):
+        try:
+            payload = [(f.name, f.getvalue()) for f in files]
+            mapping, notes = data_upload.detect_datasets(payload)
+            paths, manifest = data_upload.persist_uploaded_dataset(mapping)
+            st.session_state["upload_manifest"] = manifest
+            st.session_state["upload_notes"] = notes
+            st.session_state["upload_error"] = None
+            st.cache_resource.clear()
+            st.rerun()
+        except UploadError as exc:
+            # A plain-English reason the user can act on, not a stack trace.
+            st.session_state["upload_error"] = str(exc)
+            st.session_state["upload_manifest"] = None
+
+    if st.session_state.get("upload_error"):
+        # No `icon=` argument: Streamlit expects a Material icon identifier
+        # (":material/error:"), not an emoji, and raises on anything else.
+        st.sidebar.error(st.session_state["upload_error"])
+
+    manifest = st.session_state.get("upload_manifest")
+    if manifest:
+        st.sidebar.success("Analysing your data")
+        st.sidebar.caption(
+            "{} products · {} stock · {} ledger rows".format(
+                manifest["row_counts"].get("products", 0),
+                manifest["row_counts"].get("stock", 0),
+                manifest["row_counts"].get("sales", 0)))
+        return manifest["dataset_id"], manifest
+    return "sample", None
+
+
 def render_sidebar(products: pd.DataFrame, meta: Dict[str, object]
                    ) -> Dict[str, object]:
     st.sidebar.markdown(
@@ -484,7 +599,8 @@ def render_sidebar(products: pd.DataFrame, meta: Dict[str, object]
     )
     st.sidebar.markdown("---")
 
-    st.sidebar.markdown('<div class="side-h">Filters</div>', unsafe_allow_html=True)
+    st.sidebar.markdown('<div class="side-h">Filters</div>',
+                        unsafe_allow_html=True)
     selected_categories = st.sidebar.multiselect(
         "Category", options=sorted(products["category"].unique()),
         default=[], placeholder="All categories", key="filter_category")
@@ -1059,11 +1175,19 @@ which we do not have.
 # =============================================================================
 
 def main() -> None:
-    manifest = read_manifest()
+    # ---- 1. DATA SOURCE: sample dataset, or an accepted upload ------------
+    # Rendered before anything else so a rejection is the first thing the user
+    # sees, rather than a stack trace after a Spark run.
+    dataset_key, upload_manifest = render_data_source()
 
-    # ---- 1. LOAD (auto-bootstrap HDFS, then run Spark) --------------------
+    if dataset_key == "sample":
+        manifest = read_manifest()
+    else:
+        manifest = upload_manifest or {}
+
+    # ---- 2. LOAD (auto-bootstrap HDFS if needed, then run Spark) ---------
     try:
-        results = load_pipeline()
+        results = load_pipeline(dataset_key)
     except Exception as exc:                       # pragma: no cover
         st.error("The PySpark pipeline failed to start: {}".format(exc))
         st.exception(exc)
@@ -1075,9 +1199,14 @@ def main() -> None:
     ingestion = meta.get("ingestion", {}) or {}
 
     # ---- 2. APP BAR -------------------------------------------------------
+    is_upload = dataset_key != "sample"
+    source_badge = ('<span class="src src-upload">YOUR DATA</span>'
+                    if is_upload
+                    else '<span class="src">SAMPLE</span>')
     st.markdown("""
     <div class="appbar">
-      <div class="brand"><span class="mark">▦</span> SmartStock Inventory Control Tower</div>
+      <div class="brand"><span class="mark">▦</span> SmartStock Inventory
+        Control Tower {}</div>
       <div class="meta">
         <span>Engine <b>PySpark {}</b></span>
         <span>SKUs <b>{}</b></span>
@@ -1086,13 +1215,31 @@ def main() -> None:
         <span>Run <b>{}s</b></span>
       </div>
     </div>
-    """.format(
-        meta.get("spark_version"), len(all_products),
-        num(ingestion.get("sales_ledger_rows")),
-        meta.get("sales_window_days"), meta.get("total_seconds")),
+    """.format(source_badge, meta.get("spark_version"), len(all_products),
+               num(ingestion.get("sales_ledger_rows")),
+               meta.get("sales_window_days"), meta.get("total_seconds")),
         unsafe_allow_html=True)
 
-    # ---- 3. FILTERS + SLICE ----------------------------------------------
+    # Provenance banner: makes it unmistakable that these figures came from the
+    # user's own files rather than the built-in sample.
+    if is_upload and upload_manifest:
+        counts = upload_manifest.get("row_counts", {})
+        st.markdown(
+            '<div class="callout"><span class="ct">Analysing your uploaded '
+            'data</span>{} products &middot; {} stock rows &middot; {} ledger '
+            'rows &mdash; ingested to <code>{}</code> at {}. The figures '
+            'below come from your files, not the sample dataset.'
+            '</div>'.format(
+                counts.get("products", 0), counts.get("stock", 0),
+                counts.get("sales", 0),
+                upload_manifest.get("hdfs_uri", "?"),
+                upload_manifest.get("ingested_at", "?")),
+            unsafe_allow_html=True)
+        for warning in upload_manifest.get("warnings", []) or []:
+            st.markdown('<div class="callout warn">{}</div>'.format(warning),
+                        unsafe_allow_html=True)
+
+    # ---- 4. FILTERS + SLICE ----------------------------------------------
     filters = render_sidebar(all_products, meta)
     products = apply_filters(all_products, filters)
     empty = products.empty

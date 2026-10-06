@@ -43,6 +43,43 @@ exactly the 5 stockout SKUs.
 
 ---
 
+## Bring your own data
+
+The sidebar has a **drag-and-drop uploader**. Drop in three CSVs and they flow
+through the *identical* PySpark pipeline — the same StructType schemas, the same
+DAG, the same window function and anti-join. Only the bytes on disk change.
+
+Files are matched to a dataset by their **column headers, not their filename**,
+so `march_sales_final.csv` is still recognised as the sales ledger.
+
+| Dataset | Required columns |
+|---|---|
+| products | `product_id`, `product_name`, `category`, `cost`, `price` |
+| stock | `product_id`, `current_stock`, `safety_stock_level`, `warehouse_zone` |
+| sales | `transaction_id`, `timestamp`, `product_id`, `quantity_sold` |
+
+**Forgiving about formatting.** Header case, spacing and separators are normalised
+(`Product ID` = `product_id`); currency and thousands separators are stripped
+(`"$1,250.00"` → `1250.0`); timestamps are accepted in twelve formats including
+`2026-01-31T09:15:00`, `2026-01-31 09:15:00` and `31/01/2026 09:15`, then
+re-emitted in the single canonical format the Spark reader expects.
+
+**Strict about correctness.** Everything is validated *before* Spark sees it and
+rejected with a message you can act on — because the Spark reader runs in
+`FAILFAST` mode, which is right for production but a terrible experience as a
+Java stack trace four seconds into a job.
+
+**All three datasets are required**, deliberately. Every metric is a join of the
+three, so without `stock.csv` there are no on-hand quantities — and summing
+trapped capital over a NULL stock level yields `$0`, which reads as "no capital is
+trapped" when the truth is "we do not know". A partial upload is rejected at the
+gate rather than producing a confidently wrong dashboard.
+
+Uploads land in `hdfs/user/hadoop/inventory/uploads/<content-hash>/` with a
+`_SUCCESS` marker and a `_manifest.json`. The dataset id is a **hash of the file
+contents**, so re-uploading identical files reuses the cached Spark result while
+different files correctly re-run the job. Switch back to the sample with one button.
+
 ---
 
 ## Project structure
@@ -51,15 +88,18 @@ exactly the 5 stockout SKUs.
 ims_bigdata_analytics/
 ├── hdfs_storage_mock.py          # File 1 · HDFS namespace + data generator
 ├── pyspark_analytics_engine.py   # File 2 · PySpark analytics engine
-├── main_app.py                   # File 3 · Streamlit dashboard
+├── main_app.py                   # File 3 · Streamlit console
+├── data_upload.py                # File 4 · drag-and-drop ingestion + validation
 ├── requirements.txt
 ├── .streamlit/config.toml        # pins the light theme (see Accessibility)
 └── hdfs/                         # AUTO-GENERATED (git-ignored)
-    └── user/hadoop/inventory/raw/
-        ├── _manifest.json        # row counts, edge cases, seed
-        ├── products/products.csv + _SUCCESS
-        ├── stock/stock.csv + _SUCCESS
-        └── sales/sales_ledger.csv + _SUCCESS
+    └── user/hadoop/inventory/
+        ├── raw/                  # the sample dataset
+        │   ├── _manifest.json    # row counts, edge cases, seed
+        │   ├── products/products.csv + _SUCCESS
+        │   ├── stock/stock.csv + _SUCCESS
+        │   └── sales/sales_ledger.csv + _SUCCESS
+        └── uploads/<hash>/       # your own uploaded CSVs land here
 ```
 
 | File | Demonstrates |
@@ -67,6 +107,7 @@ ims_bigdata_analytics/
 | `hdfs_storage_mock.py` | HDFS as WORM storage, blocks + replication, `_SUCCESS` commit markers, deterministic seeding, Pareto-skewed demand |
 | `pyspark_analytics_engine.py` | `StructType` schema-on-read, lazy evaluation, lineage graphs, actions vs transformations, window functions, `LEFT ANTI JOIN`, broadcast joins, `.cache()`, AQE, Arrow |
 | `main_app.py` | `st.cache_resource` for one shared SparkSession, driver-side filtering of a 60-row payload, Plotly, WCAG-AA design system |
+| `data_upload.py` | Drag-and-drop ingestion: header-signature dataset detection, type coercion, a pre-Spark validation gate, content-addressed HDFS landing |
 
 ---
 
@@ -250,6 +291,9 @@ To restyle, edit `[theme]` in `.streamlit/config.toml` and restart.
 | Empty KPIs | Filters exclude everything | **Reset all filters** in the sidebar |
 | Port 8501 busy | Another instance | `streamlit run main_app.py --server.port 8502` |
 | Text looks faint / wrong colours | A dark OS theme is overriding Streamlit | Confirm `.streamlit/config.toml` exists and restart the app |
+| Upload rejected, "missing required dataset" | You dropped fewer than three CSVs | All three are required — see *Bring your own data* |
+| Upload rejected, "not valid UTF-8" | Excel exported as UTF-16 | Re-save as CSV (UTF-8) |
+| Upload rejected, "quantity_sold <= 0" | Your ledger contains returns/refunds rows | This dataset models positive sales only — filter them out first |
 
 **Set `JAVA_HOME` if needed**
 
